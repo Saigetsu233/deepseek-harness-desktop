@@ -12,8 +12,17 @@
  *
  * 配置（按优先级从高到低）：
  *  环境变量  DSH_DESKTOP_PORT / DSH_DESKTOP_WORKSPACE / DSH_DESKTOP_COMMAND
- *  配置文件  %APPDATA%\DSH Desktop\config.json  （{"port":3080,"workspace":"...","dshCommand":"dsh"}）
+ *            以及 DSH_DESKTOP_ICON / DSH_DESKTOP_BACKGROUND / DSH_DESKTOP_BACKGROUND_DIM
+ *            / DSH_DESKTOP_CUSTOM_CSS / DSH_DESKTOP_WINDOW_BACKGROUND
+ *  配置文件  %APPDATA%\DSH Desktop\config.json
  *  默认值    port=3080, workspace=用户主目录, dshCommand=dsh
+ *
+ * 自定义（都在 config.json 里）：
+ *  icon            窗口/任务栏图标（png 或 ico 路径），默认用内置图标
+ *  backgroundImage 背景图片路径，铺满窗口，UI 各面板自动变半透明露出背景
+ *  backgroundDim   背景变暗程度 0-1（默认 0.45，保证文字可读）
+ *  customCss       自定义 CSS 文件路径，页面加载后注入（高级玩法）
+ *  windowBackground  窗口底色（加载期间/无背景图时可见），默认 #0b1220
  */
 
 const { app, BrowserWindow, dialog, nativeImage, screen, shell } = require('electron');
@@ -22,6 +31,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const { pathToFileURL } = require('node:url');
 
 const DEFAULT_PORT = 3080;
 const READY_TIMEOUT_MS = 90 * 1000; // 等待 dsh 启动就绪的最长时间
@@ -53,7 +63,12 @@ function loadConfig() {
   const port = Number(process.env.DSH_DESKTOP_PORT ?? cfg.port ?? DEFAULT_PORT);
   const workspace = process.env.DSH_DESKTOP_WORKSPACE ?? cfg.workspace ?? os.homedir();
   const dshCommand = process.env.DSH_DESKTOP_COMMAND ?? cfg.dshCommand ?? 'dsh';
-  return { port, workspace, dshCommand, configFile: file };
+  const icon = process.env.DSH_DESKTOP_ICON ?? cfg.icon ?? '';
+  const backgroundImage = process.env.DSH_DESKTOP_BACKGROUND ?? cfg.backgroundImage ?? '';
+  const backgroundDim = Number(process.env.DSH_DESKTOP_BACKGROUND_DIM ?? cfg.backgroundDim ?? 0.45);
+  const customCss = process.env.DSH_DESKTOP_CUSTOM_CSS ?? cfg.customCss ?? '';
+  const windowBackground = process.env.DSH_DESKTOP_WINDOW_BACKGROUND ?? cfg.windowBackground ?? '#0b1220';
+  return { port, workspace, dshCommand, icon, backgroundImage, backgroundDim, customCss, windowBackground, configFile: file };
 }
 
 // ── 端口探测：确认是「DeepSeek Harness」本尊而不是别的服务 ─────────────────
@@ -195,17 +210,79 @@ function clampBounds(saved) {
   return { x, y, width, height };
 }
 
-function createWindow(url) {
+/**
+ * 应用界面自定义：背景图 + 面板半透明 + 自定义 CSS。
+ * DSH Web UI 的背景色全部由 body 上的设计变量控制
+ * （--dsw-alias-bg-base / --dsw-alias-bg-layer-* / --dsw-specific-*），
+ * 所以把变量覆盖成半透明即可让背景图透出来，且明暗主题都能用。
+ */
+async function applyCustomizations(win, cfg) {
+  const parts = [];
+
+  if (cfg.backgroundImage && fs.existsSync(cfg.backgroundImage)) {
+    const url = pathToFileURL(path.resolve(cfg.backgroundImage)).href;
+    const dim = Math.min(0.9, Math.max(0, Number(cfg.backgroundDim) || 0.45));
+    // 探测当前主题，选对应的面板底色（深色/浅色）
+    const dark = await win.webContents
+      .executeJavaScript(`document.body ? document.body.hasAttribute('data-ds-dark-theme') : true`)
+      .catch(() => true);
+    const layer = dark ? '13,17,23' : '249,250,251'; // 面板/侧栏底色
+    const bubble = dark ? '22,27,34' : '255,255,255'; // 聊天气泡底色
+    const panelA = (1 - dim * 0.6).toFixed(3);        // 面板不透明度
+    const surfaceA = (1 - dim * 0.75).toFixed(3);     // 侧栏/输入区不透明度
+    parts.push(`
+      html {
+        background:
+          linear-gradient(rgba(0,0,0,${dim.toFixed(3)}), rgba(0,0,0,${dim.toFixed(3)})),
+          url("${url}") center/cover no-repeat fixed !important;
+        background-color: ${cfg.windowBackground} !important;
+      }
+      body { background: transparent !important; }
+      body, body[data-ds-dark-theme] {
+        --dsw-alias-bg-base: rgba(0,0,0,0) !important;
+        --dsw-alias-bg-layer-1: rgba(${layer},${panelA}) !important;
+        --dsw-alias-bg-layer-2: rgba(${layer},${panelA}) !important;
+        --dsw-alias-bg-layer-3: rgba(${layer},${panelA}) !important;
+        --dsw-specific-sidebar-fill: rgba(${layer},${surfaceA}) !important;
+        --dsw-specific-bubble: rgba(${bubble},${surfaceA}) !important;
+        --dsw-specific-input-major: rgba(${layer},${surfaceA}) !important;
+      }
+    `);
+    log(`已启用背景图：${cfg.backgroundImage}（变暗 ${dim.toFixed(2)}，主题 ${dark ? 'dark' : 'light'}）`);
+  }
+
+  if (cfg.customCss && fs.existsSync(cfg.customCss)) {
+    try {
+      parts.push(fs.readFileSync(cfg.customCss, 'utf8'));
+      log(`已加载自定义 CSS：${cfg.customCss}`);
+    } catch (e) {
+      log('读取自定义 CSS 失败:', e.message);
+    }
+  }
+
+  if (parts.length) {
+    try {
+      await win.webContents.insertCSS(parts.join('\n'));
+      log('自定义样式注入完成');
+    } catch (e) {
+      log('注入自定义样式失败:', e.message);
+    }
+  }
+}
+
+function createWindow(url, cfg) {
   const saved = loadWindowState();
   const bounds = clampBounds(saved);
-  const icon = nativeImage.createFromPath(path.join(__dirname, 'build', 'icon.png'));
+  const builtinIcon = path.join(__dirname, 'build', 'icon.png');
+  const iconPath = cfg.icon && fs.existsSync(cfg.icon) ? cfg.icon : builtinIcon;
+  const icon = nativeImage.createFromPath(iconPath);
 
   const win = new BrowserWindow({
     ...bounds,
     minWidth: 960,
     minHeight: 600,
     autoHideMenuBar: true,
-    backgroundColor: '#0b1220',
+    backgroundColor: cfg.windowBackground || '#0b1220',
     title: 'DSH Desktop',
     icon: icon.isEmpty() ? undefined : icon,
     webPreferences: {
@@ -224,7 +301,18 @@ function createWindow(url) {
     });
   }
 
-  win.loadURL(url);
+  // 页面加载过程日志（排障用，平时也能看到）
+  win.webContents.on('did-finish-load', () => log(`页面加载完成：${url}`));
+  win.webContents.on('did-fail-load', (_e, code, desc, failedUrl) => {
+    log(`页面加载失败 (${code}) ${desc}：${failedUrl}`);
+  });
+  win.webContents.on('render-process-gone', (_e, details) => {
+    log(`渲染进程异常退出：${details.reason} (exitCode=${details.exitCode})`);
+  });
+
+  win.loadURL(url).then(() => applyCustomizations(win, cfg)).catch((e) => {
+    log('页面加载异常:', e.message);
+  });
 
   // 同源（本服务内的）弹窗/跳转放行；跨源的一律交给系统默认浏览器
   const isSameOrigin = (target) => {
@@ -291,10 +379,10 @@ if (!gotLock) {
       return;
     }
 
-    mainWindow = createWindow(url);
+    mainWindow = createWindow(url, cfg);
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow(url);
+      if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow(url, cfg);
     });
   });
 }
