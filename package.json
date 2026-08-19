@@ -16,8 +16,8 @@
   },
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win",
-    "dist:mac": "electron-builder --mac",
+    "dist": "electron-builder --win --publish never",
+    "dist:mac": "electron-builder --mac --publish never",
     "gen-icon": "node scripts/gen-icon.mjs"
   },
   "devDependencies": {
