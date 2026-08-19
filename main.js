@@ -260,7 +260,11 @@ function dshNodeModulesDirOf(command) {
   return '';
 }
 
-const PLUGIN_SRC = path.join(__dirname, 'plugin-token-cost');
+// 插件源目录：开发模式在项目目录；打包后通过 extraResources 放在 asar 外的 resources 目录
+//（asar 里的目录 fs.cpSync 会 ENOENT，所以必须用 asar 外的真实目录）
+const PLUGIN_SRC = __dirname.includes('app.asar')
+  ? path.join(process.resourcesPath, 'plugin-token-cost')
+  : path.join(__dirname, 'plugin-token-cost');
 
 /** 用户 dsh 主目录（$DSH_HOME 或 ~/.dsh） */
 function dshHomeDir() {
@@ -752,8 +756,11 @@ if (!gotLock) {
 }
 
 function iconPathFor(cfg) {
-  const builtinIcon = path.join(__dirname, 'build', 'icon.png');
-  return cfg.icon && fs.existsSync(cfg.icon) ? cfg.icon : builtinIcon;
+  if (cfg.icon && fs.existsSync(cfg.icon)) return cfg.icon;
+  // 打包后图标在 asar 外（extraResources），nativeImage 无法读 asar 路径
+  return __dirname.includes('app.asar')
+    ? path.join(process.resourcesPath, 'icon.png')
+    : path.join(__dirname, 'build', 'icon.png');
 }
 
 app.on('window-all-closed', () => {
