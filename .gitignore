@@ -3,3 +3,5 @@ dist/
 .npm-cache/
 .electron-cache/
 smoke-run.log
+smoke*.log
+.test-install/

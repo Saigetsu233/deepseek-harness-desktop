@@ -6,9 +6,12 @@
  * 职责：
  *  1. 检测 http://127.0.0.1:<port> 是否已有 DSH Web 服务在运行（例如你已手动
  *     启动过 `dsh web`）。有则直接复用，不重复启动、退出时也不去停它。
- *  2. 没有则自动启动 `dsh web --port <port>`（配置的工作目录作为 workspace 根），
- *     等端口就绪后打开窗口；关闭应用时自动把启动的 dsh 进程连同其子进程一起停掉。
- *  3. 打开一个原生窗口承载该地址（无地址栏、外链走系统浏览器、记住窗口位置）。
+ *  2. dsh 命令自动就绪：检测顺序为 应用自带安装 → 系统 PATH → 都没有则弹出
+ *     进度窗口自动 npm 安装（装到应用用户目录，无需管理员权限）。
+ *  3. 启动 `dsh web --port <port>`（配置的工作目录作为 workspace 根），
+ *     等端口就绪后打开窗口；关闭窗口=隐藏到托盘继续后台运行，
+ *     只有托盘菜单"退出"才真正退出并停止自启的 dsh 进程（连同子进程）。
+ *  4. 渲染进程崩溃/页面加载失败会自动重载恢复，不会整个窗口消失。
  *
  * 配置（按优先级从高到低）：
  *  环境变量  DSH_DESKTOP_PORT / DSH_DESKTOP_WORKSPACE / DSH_DESKTOP_COMMAND
@@ -25,7 +28,7 @@
  *  windowBackground  窗口底色（加载期间/无背景图时可见），默认 #0b1220
  */
 
-const { app, BrowserWindow, dialog, nativeImage, screen, shell } = require('electron');
+const { app, BrowserWindow, dialog, Menu, nativeImage, screen, shell, Tray } = require('electron');
 const { spawn, execFileSync } = require('node:child_process');
 const http = require('node:http');
 const fs = require('node:fs');
@@ -62,7 +65,9 @@ function loadConfig() {
   }
   const port = Number(process.env.DSH_DESKTOP_PORT ?? cfg.port ?? DEFAULT_PORT);
   const workspace = process.env.DSH_DESKTOP_WORKSPACE ?? cfg.workspace ?? os.homedir();
-  const dshCommand = process.env.DSH_DESKTOP_COMMAND ?? cfg.dshCommand ?? 'dsh';
+  // dshCommand：显式指定（含环境变量）则尊重；否则走"自动"（本地安装 → PATH → 自动安装）
+  const explicitDsh = process.env.DSH_DESKTOP_COMMAND !== undefined || cfg.dshCommand !== undefined;
+  const dshCommand = explicitDsh ? (process.env.DSH_DESKTOP_COMMAND ?? cfg.dshCommand ?? 'dsh') : 'auto';
   const icon = process.env.DSH_DESKTOP_ICON ?? cfg.icon ?? '';
   const backgroundImage = process.env.DSH_DESKTOP_BACKGROUND ?? cfg.backgroundImage ?? '';
   const backgroundDim = Number(process.env.DSH_DESKTOP_BACKGROUND_DIM ?? cfg.backgroundDim ?? 0.45);
@@ -96,6 +101,108 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function tail(lines, n = 20) {
   return lines.slice(-n).join('\n');
+}
+
+// ── dsh 探测与自动安装 ──────────────────────────────────────────────────────
+// 应用自带一份 dsh 安装在 userData/dsh-install（用户目录，无需管理员权限）；
+// 检测顺序：本地安装 → 系统 PATH → 都没有则自动 npm 安装。
+const localDshDir = () => path.join(app.getPath('userData'), 'dsh-install');
+
+function localDshCmd() {
+  const dir = localDshDir();
+  const win = path.join(dir, 'node_modules', '.bin', 'dsh.cmd');
+  const unix = path.join(dir, 'node_modules', '.bin', 'dsh');
+  return process.platform === 'win32'
+    ? (fs.existsSync(win) ? win : '')
+    : (fs.existsSync(unix) ? unix : '');
+}
+
+/** 探测某个 dsh 命令是否可用（--help 能正常退出即认为可用） */
+function dshExists(command, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+    try {
+      // 路径含空格时给 shell 加引号；普通命令名直接传
+      const cmd = /\s/.test(command) ? `"${command}"` : command;
+      const child = spawn(cmd, ['--help'], { shell: true, windowsHide: true, stdio: 'ignore' });
+      const timer = setTimeout(() => { try { child.kill(); } catch {} finish(false); }, timeoutMs);
+      child.on('error', () => { clearTimeout(timer); finish(false); });
+      child.on('exit', (code) => { clearTimeout(timer); finish(code === 0); });
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+const INSTALL_HTML = `<!doctype html><html lang="zh"><head><meta charset="utf-8"><style>
+  body{margin:0;padding:20px;background:#0b1220;color:#e6edf3;font:13px/1.7 "Microsoft YaHei",system-ui,sans-serif}
+  h1{font-size:15px;margin:0 0 12px}
+  pre{background:#060a12;border:1px solid #243049;border-radius:8px;padding:12px;height:230px;overflow:auto;font-size:12px;color:#9fb3c8;white-space:pre-wrap;word-break:break-all}
+  p{font-size:12px;color:#76839a;margin:12px 0 0}
+</style></head><body>
+<h1>首次运行：自动安装 DSH（DeepSeek Harness）</h1>
+<pre id="log"></pre>
+<p>安装完成后会自动启动，全程无需手动配置。</p>
+<script>
+function appendLog(t){var el=document.getElementById('log');el.textContent+=(el.textContent?'\\n':'')+t;el.scrollTop=el.scrollHeight;}
+</script></body></html>`;
+
+/** 自动安装 dsh 到应用目录；返回是否成功 */
+async function autoInstallDsh() {
+  const dir = localDshDir();
+  log(`未检测到 dsh，开始自动安装到 ${dir}`);
+  const win = new BrowserWindow({
+    width: 560, height: 400, resizable: false, autoHideMenuBar: true,
+    backgroundColor: '#0b1220', title: '安装 DSH…',
+  });
+  await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(INSTALL_HTML));
+  const showLog = (t) => {
+    if (win.isDestroyed()) return;
+    win.webContents.executeJavaScript(`appendLog(${JSON.stringify(String(t).slice(0, 400))})`).catch(() => {});
+  };
+  showLog('正在执行：npm install -g 等价本地安装 @deepseek-ai/dsh …');
+  const ok = await new Promise((resolve) => {
+    const child = spawn('npm', ['install', '--prefix', dir, '--no-audit', '--no-fund', '@deepseek-ai/dsh'], {
+      shell: true,
+      windowsHide: true,
+      env: { ...process.env, npm_config_cache: path.join(dir, '.npm-cache') },
+    });
+    child.stdout?.on('data', (d) => showLog(d.toString()));
+    child.stderr?.on('data', (d) => showLog(d.toString()));
+    child.on('error', (err) => {
+      showLog('无法启动 npm：' + err.message);
+      showLog('请先安装 Node.js（https://nodejs.org）后重试。');
+      resolve(false);
+    });
+    child.on('exit', (code) => {
+      showLog(code === 0 ? '安装完成 ✓' : '安装失败（退出码 ' + code + '）');
+      resolve(code === 0);
+    });
+  });
+  if (!win.isDestroyed()) win.destroy();
+  return ok && !!localDshCmd();
+}
+
+/** 解析最终使用的 dsh 命令（自动模式：本地 → PATH → 自动安装） */
+async function resolveDshCommand(cfg) {
+  if (cfg.dshCommand !== 'auto') return cfg.dshCommand;
+  const local = localDshCmd();
+  if (local && (await dshExists(local))) {
+    log(`使用应用自带的 DSH：${local}`);
+    return local;
+  }
+  if (await dshExists('dsh')) {
+    log('检测到系统已安装 dsh');
+    return 'dsh';
+  }
+  log('未检测到 dsh，尝试自动安装…');
+  if (await autoInstallDsh()) {
+    const cmd = localDshCmd();
+    log(`自动安装完成，DSH 位于：${cmd}`);
+    return cmd;
+  }
+  return null;
 }
 
 // ── dsh 服务生命周期 ────────────────────────────────────────────────────────
@@ -186,6 +293,32 @@ async function ensureServer(cfg) {
 
 // ── 窗口 ────────────────────────────────────────────────────────────────────
 let mainWindow = null;
+let tray = null;
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function createTray(iconPath) {
+  try {
+    const icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
+    tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
+    tray.setToolTip('DSH Desktop（双击显示，退出请用菜单）');
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: '显示主窗口', click: showMainWindow },
+      { type: 'separator' },
+      { label: '退出', click: () => app.quit() },
+    ]));
+    tray.on('click', showMainWindow);
+    tray.on('double-click', showMainWindow);
+    log('托盘图标已就绪（关窗后应用在后台继续运行）');
+  } catch (e) {
+    log('创建托盘图标失败:', e.message);
+  }
+}
 
 function loadWindowState() {
   try {
@@ -273,8 +406,7 @@ async function applyCustomizations(win, cfg) {
 function createWindow(url, cfg) {
   const saved = loadWindowState();
   const bounds = clampBounds(saved);
-  const builtinIcon = path.join(__dirname, 'build', 'icon.png');
-  const iconPath = cfg.icon && fs.existsSync(cfg.icon) ? cfg.icon : builtinIcon;
+  const iconPath = iconPathFor(cfg);
   const icon = nativeImage.createFromPath(iconPath);
 
   const win = new BrowserWindow({
@@ -293,26 +425,55 @@ function createWindow(url, cfg) {
   });
   if (saved.maximized) win.maximize();
 
-  // 冒烟测试钩子：DSH_DESKTOP_SMOKE_TEST=1 时，页面加载后 8 秒自动退出（仅用于自动化验证）
+  // 冒烟测试钩子：DSH_DESKTOP_SMOKE_TEST=1 时，加载后验证「关窗隐藏」行为再自动退出
   if (process.env.DSH_DESKTOP_SMOKE_TEST === '1') {
     win.webContents.once('did-finish-load', () => {
-      log('SMOKE TEST: 页面加载完成，8 秒后自动退出');
-      setTimeout(() => app.quit(), 8000);
+      log('SMOKE TEST: 页面加载完成，开始验证「关窗隐藏到托盘」行为');
+      setTimeout(() => {
+        win.close(); // 应被 close 拦截为隐藏而非退出
+        setTimeout(() => {
+          const alive = !!mainWindow && !mainWindow.isDestroyed();
+          const hidden = alive && !mainWindow.isVisible();
+          log(`SMOKE TEST: 关窗后 窗口已隐藏=${!!hidden} 应用仍存活=${alive}`);
+          app.quit();
+        }, 1500);
+      }, 6000);
     });
   }
 
-  // 页面加载过程日志（排障用，平时也能看到）
-  win.webContents.on('did-finish-load', () => log(`页面加载完成：${url}`));
-  win.webContents.on('did-fail-load', (_e, code, desc, failedUrl) => {
-    log(`页面加载失败 (${code}) ${desc}：${failedUrl}`);
-  });
-  win.webContents.on('render-process-gone', (_e, details) => {
-    log(`渲染进程异常退出：${details.reason} (exitCode=${details.exitCode})`);
+  // 页面加载完成：每次（含崩溃后自动重载）都重新应用自定义样式
+  win.webContents.on('did-finish-load', () => {
+    log(`页面加载完成：${url}`);
+    applyCustomizations(win, cfg).catch((e) => log('应用自定义样式失败:', e.message));
   });
 
-  win.loadURL(url).then(() => applyCustomizations(win, cfg)).catch((e) => {
-    log('页面加载异常:', e.message);
+  // 加载失败自动重试（最多 5 次，等 3 秒再试；忽略主动跳转的 -3 中止）
+  let failCount = 0;
+  win.webContents.on('did-fail-load', (_e, code, desc, failedUrl, isMainFrame) => {
+    if (!isMainFrame || code === -3) return;
+    log(`页面加载失败 (${code}) ${desc}：${failedUrl}`);
+    if (!quitting && mainWindow && !mainWindow.isDestroyed() && failCount < 5) {
+      failCount++;
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed() && !win.webContents.isLoading()) {
+          log(`自动重试加载（第 ${failCount} 次）…`);
+          win.webContents.reload();
+        }
+      }, 3000);
+    }
   });
+
+  // 渲染进程崩溃：自动恢复（重载页面），而不是让窗口消失/整个应用退出
+  win.webContents.on('render-process-gone', (_e, details) => {
+    log(`渲染进程异常退出：${details.reason} (exitCode=${details.exitCode})，1.5 秒后自动恢复…`);
+    if (!quitting) {
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) win.webContents.reload();
+      }, 1500);
+    }
+  });
+
+  win.loadURL(url).catch((e) => log('页面加载异常:', e.message));
 
   // 同源（本服务内的）弹窗/跳转放行；跨源的一律交给系统默认浏览器
   const isSameOrigin = (target) => {
@@ -340,7 +501,16 @@ function createWindow(url, cfg) {
       );
     } catch { /* 忽略 */ }
   };
-  win.on('close', saveState);
+
+  // 关窗 = 隐藏到托盘，后台继续跑（只有托盘菜单里的"退出"才真正退出）
+  win.on('close', (event) => {
+    saveState();
+    if (!quitting) {
+      event.preventDefault();
+      win.hide();
+      log('窗口已隐藏到托盘（任务在后台继续，托盘菜单可退出）');
+    }
+  });
   win.on('closed', () => { mainWindow = null; });
 
   return win;
@@ -357,10 +527,7 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
-    }
+    showMainWindow();
   });
 
   app.whenReady().then(async () => {
@@ -369,6 +536,14 @@ if (!gotLock) {
     log('=== DSH Desktop 启动 ===');
 
     const cfg = loadConfig();
+    const dsh = await resolveDshCommand(cfg);
+    if (!dsh) {
+      showFatal('自动安装 DSH 失败。\n\n请手动安装后重试：\n  npm install -g @deepseek-ai/dsh\n\n（需要本机已安装 Node.js：https://nodejs.org）');
+      app.exit(1);
+      return;
+    }
+    cfg.dshCommand = dsh;
+
     let url;
     try {
       url = await ensureServer(cfg);
@@ -380,6 +555,7 @@ if (!gotLock) {
     }
 
     mainWindow = createWindow(url, cfg);
+    createTray(iconPathFor(cfg));
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow(url, cfg);
@@ -387,13 +563,20 @@ if (!gotLock) {
   });
 }
 
+function iconPathFor(cfg) {
+  const builtinIcon = path.join(__dirname, 'build', 'icon.png');
+  return cfg.icon && fs.existsSync(cfg.icon) ? cfg.icon : builtinIcon;
+}
+
 app.on('window-all-closed', () => {
-  app.quit();
+  // 不退出：窗口关闭已被 close 拦截为隐藏，这里兜底保持后台运行（托盘退出）
+  log('所有窗口已关闭，应用保持后台运行（如需完全退出请用托盘菜单）');
 });
 
 app.on('before-quit', () => {
   quitting = true;
   killServerTree();
+  try { tray?.destroy(); } catch { /* 忽略 */ }
 });
 
 process.on('exit', () => {
