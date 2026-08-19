@@ -5,3 +5,8 @@ dist/
 smoke-run.log
 smoke*.log
 .test-install/
+
+.test-dsh-home*
+.test-patch.yml
+iso-srv*.log
+.test-server.log

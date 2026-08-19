@@ -1,0 +1,5 @@
+# token-cost 插件自身的补丁层：作为 profile bundle 加载时，用它把自己的
+# host/client 行插入到组合树里。
+- insert:
+    - id: token-cost
+      name: 'token-cost'

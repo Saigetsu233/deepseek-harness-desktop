@@ -3,49 +3,52 @@
 [![GitHub release](https://img.shields.io/github/v/release/Saigetsu233/deepseek-harness-desktop)](https://github.com/Saigetsu233/deepseek-harness-desktop/releases)
 [![License](https://img.shields.io/github/license/Saigetsu233/deepseek-harness-desktop)](LICENSE)
 
-把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Web UI 包成一个桌面应用（Electron）。
-双击打开就是个独立窗口，不用先开终端敲 `dsh web` 再开浏览器。
+把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Web UI 包成桌面应用（Electron）。
+装上就是一个带桌面图标的原生应用：自动装好 dsh、自动起服务、崩溃自愈、关窗进托盘后台继续跑。
 
 ## 它做什么
 
-- 启动时自动拉起 `dsh web`（端口默认 3080），窗口直接指向本地服务
-- 如果你已经手动跑着 `dsh web`，它直接连上，不会重复起服务
-- 关窗口 = 最小化到托盘，任务在后台继续跑；托盘菜单里的"退出"才会真正关掉（包括停掉它自己拉起的服务）
-- 渲染进程崩了会自动重载页面，不会整个窗口消失
-- 记住窗口位置、外链走系统浏览器、单实例（重复打开会聚焦已有窗口）
+- **安装即用**：首次运行自动检测 dsh，没有就自动装上（有进度窗口，全程无需命令行）
+- **自动起服务**：拉起 `dsh web`（默认 3080），窗口直接指向本地服务；已有服务则直接复用
+- **服务自愈**：每 5 秒健康检查，服务进程意外退出（包括工具调用期间）会自动重启并刷新窗口，不再"断开后没反应"
+- **工作区智能识别**：默认采用你最近使用的工作区（读 dsh 的 workspace 记录），重启后会话不丢
+- **后台托管**：关窗口 = 缩到托盘，任务继续跑；托盘菜单"退出"才真正结束（并停掉它自启的服务）
+- **崩溃恢复**：渲染进程崩了自动重载页面，加载失败持续重试
+- **内置插件**：自动加载 token 费用统计插件（见下）
+- 记住窗口位置、外链走系统浏览器、单实例
 
-## 下载
+## 下载与安装
 
-去 [Releases](https://github.com/Saigetsu233/deepseek-harness-desktop/releases) 页面：
+去 [Releases](https://github.com/Saigetsu233/deepseek-harness-desktop/releases)：
 
-| 平台 | 文件 |
-|---|---|
-| Windows x64 | `DSH-Desktop-<版本>.exe`（portable，双击即用） |
-| macOS Intel | `DSH.Desktop-<版本>.dmg` / `.zip` |
-| macOS Apple Silicon | `DSH.Desktop-<版本>-arm64.dmg` / `.zip` |
+| 平台 | 文件 | 说明 |
+|---|---|---|
+| Windows x64 | `DSH-Desktop-Setup-<版本>.exe` | **安装版**：可选目录、自动创建桌面图标和开始菜单 |
+| Windows x64 | `DSH-Desktop-<版本>.exe` | portable 免安装版 |
+| macOS Intel / Apple Silicon | `DSH.Desktop-<版本>-x64/arm64.dmg` `.zip` | 拷到"应用程序" |
 
-应用没做签名，首次运行的提示按下面处理：
+安装版向导里可以直接改安装目录；桌面图标默认创建。卸载走"设置 → 应用"，应用数据（含 token 账本）默认保留。
 
-- Windows：SmartScreen 弹"已保护你的电脑" → 点"更多信息" → "仍要运行"
-- macOS：右键应用图标 → "打开"，或在"系统设置 → 隐私与安全性"里允许
+应用未签名，首次运行的提示：Windows SmartScreen 点"更多信息 → 仍要运行"；macOS 右键打开。
 
-## 前提：你得先有 dsh
+## 关于 dsh 和密钥
 
-这个应用只是个壳，真正干活的是 `dsh` 命令行。先确保它能用：
+- **dsh 自动就绪**：优先用应用自带的 dsh（装在用户目录，免管理员）；没有就自动 npm 安装；你手动装的（PATH 里有）也会直接用
+- **应用里没有任何密钥**，也不碰你的密钥。模型 API Key 配置在你本机 dsh 的环境/配置里（`C:\Users\<你>\.dsh`），不进这个仓库、不被这个应用读取转发。服务只监听 127.0.0.1
 
-```bash
-npm install -g @deepseek-ai/dsh
-dsh web   # 能打开 Web UI 就行
-```
+## Token 费用统计插件
 
-## 关于密钥
+设置 → "费用统计"，实时显示：
 
-**应用里没有任何密钥，也不碰你的密钥。** 它只是调起 `dsh`，你的模型 API Key（比如 DeepSeek 的）配置在你自己本机的 dsh 环境/配置里（`C:\Users\<你>\.dsh` 或环境变量），不会进这个仓库，也不会被这个应用读取或转发。服务只监听 127.0.0.1。
+- **今日花费**（¥），分高峰/低谷
+- 按模型的输入/输出 token 与花费明细
+- 缓存命中节省估算、最近 7 天趋势
+
+计价按 **DeepSeek 官方 2026-08-17 公告**：V4-Flash / V4-Pro 高峰时段（每日 9:00–14:00 北京时间）价格为空闲时段的 2 倍，输入区分缓存命中/未命中。数据按北京时间每日累计，存在本机浏览器（localStorage），刷新、重启不丢。价格表在 `plugin-token-cost/pricing.js`，官方调价后改那里即可。
 
 ## 配置
 
-配置文件：`%APPDATA%\DSH Desktop\config.json`（Windows）/
-`~/Library/Application Support/DSH Desktop/config.json`（macOS）。没有就自己建一个：
+配置文件：`%APPDATA%\DSH Desktop\config.json`（Windows）/ `~/Library/Application Support/DSH Desktop/config.json`（macOS）：
 
 ```json
 {
@@ -61,29 +64,28 @@ dsh web   # 能打开 Web UI 就行
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `port` | `3080` | 服务端口 |
-| `workspace` | 用户主目录 | dsh 的工作根目录（agent 默认在这里干活） |
-| `dshCommand` | `dsh` | dsh 命令，找不到时可以写完整路径 |
-| `icon` | 内置鲸鱼图标 | 窗口/托盘图标（png/ico） |
-| `backgroundImage` | 无 | 背景图，铺满窗口，界面面板自动变半透明 |
-| `backgroundDim` | `0.45` | 背景压暗程度（0-1），越大越暗、面板越透 |
-| `customCss` | 无 | 自定义 CSS 文件路径，加载后注入 |
+| `workspace` | 最近使用的工作区 | dsh 工作根目录；不配置就自动用最近的那个 |
+| `dshCommand` | 自动 | dsh 命令，自动模式优先应用自带安装 |
+| `icon` | 内置鲸鱼图标 | 窗口/托盘图标 |
+| `backgroundImage` | 无 | 背景图，面板自动变半透明露出 |
+| `backgroundDim` | `0.45` | 背景压暗程度（0-1） |
+| `customCss` | 无 | 自定义 CSS 文件 |
 | `windowBackground` | `#0b1220` | 窗口底色 |
 
-所有字段也支持环境变量（`DSH_DESKTOP_PORT`、`DSH_DESKTOP_WORKSPACE` 等，一一对应）。
+环境变量覆盖：`DSH_DESKTOP_PORT`、`DSH_DESKTOP_WORKSPACE`、`DSH_DESKTOP_COMMAND`、`DSH_DESKTOP_ICON`、`DSH_DESKTOP_BACKGROUND`、`DSH_DESKTOP_BACKGROUND_DIM`、`DSH_DESKTOP_CUSTOM_CSS`、`DSH_DESKTOP_WINDOW_BACKGROUND`。
 
 ### 自定义界面
 
-- **背景图**：设 `backgroundImage` 即可。DSH 界面的背景色都走 CSS 变量（`--dsw-alias-bg-*` 那套），应用会把面板层改成半透明让背景透出来，明暗主题都适配。
-- **自定义 CSS**：想再往深了调就写个 css 文件给 `customCss`。常用变量：
+背景图：设 `backgroundImage`，界面背景色走 CSS 变量（`--dsw-alias-bg-*`），面板层自动半透明，明暗主题都适配。深度定制用 `customCss`，例如：
 
-  ```css
-  body, body[data-ds-dark-theme] {
-    --dsw-specific-sidebar-fill: rgba(13, 17, 23, 0.35) !important; /* 侧栏更透 */
-    --dsw-specific-bubble: rgba(22, 27, 34, 0.5) !important;        /* 气泡半透明 */
-  }
-  ```
+```css
+body, body[data-ds-dark-theme] {
+  --dsw-specific-sidebar-fill: rgba(13, 17, 23, 0.35) !important;
+  --dsw-specific-bubble: rgba(22, 27, 34, 0.5) !important;
+}
+```
 
-  完整变量表在 DevTools 里看 `body` 元素。
+完整变量表在 DevTools 里看 `body`。
 
 ## 从源码构建
 
@@ -95,36 +97,29 @@ cd deepseek-harness-desktop
 npm install
 
 npm start        # 直接跑
-npm run dist     # 打 Windows exe（在 Windows 上）
-npm run dist:mac # 打 macOS dmg/zip（必须在 macOS 上）
+npm run dist     # Windows 安装版 + portable（在 Windows 上）
+npm run dist:mac # macOS dmg/zip（必须在 macOS 上）
 ```
 
-macOS 的 dmg 只能在 macOS 上打。仓库的 CI 配好了：**推 `v*` 标签会自动在云端把 Windows 和 macOS 的产物都打出来发到 Releases**，不用自己装环境。
+CI 已配好：推 `v*` 标签自动在云端构建 Windows + macOS 全平台产物并发布。
 
-## 日志
+## 日志与排障
 
-`%APPDATA%\DSH Desktop\server.log`，含 dsh 服务输出和应用自己的运行日志，排障先看这里。
+`%APPDATA%\DSH Desktop\server.log`，含 dsh 服务输出、插件部署、自愈记录。服务意外退出时日志里会带出它最后的输出，好排查原因。
 
-## 常见问题
-
-**提示找不到 dsh**：命令行确认 `dsh web` 能跑；npx 装的 dsh 在 `%APPDATA%\npm` 或 npx 缓存里，可以在配置里用 `dshCommand` 写全路径。
-
-**端口被占**：改 `port`。注意如果是另一个 dsh 实例占着，应用会直接复用。
-
-**背景图不生效**：确认路径存在、`backgroundDim` 在 0-1 之间，改完配置重启应用。
-
-**怎么完全退出**：托盘图标右键 → "退出"（或者任务管理器）。
+- **提示找不到 dsh**：确认命令行 `dsh web` 能跑；也可以 `dshCommand` 写完整路径
+- **端口被占**：改 `port`；若是另一个 dsh 实例占着会直接复用
+- **怎么完全退出**：托盘图标右键 → "退出"
+- **背景图不生效**：确认路径存在、`backgroundDim` 在 0-1，改完重启
 
 ## 发布流程（维护者）
 
 ```bash
 git add -A && git commit -m "改了什么"
 git push
-git tag v1.2.0 && git push origin v1.2.0
+git tag v1.3.0 && git push origin v1.3.0
 ```
 
 ## License
 
-[MIT](LICENSE)
-
-社区封装，和 DeepSeek 官方没有隶属关系；图标用的是 DeepSeek 官方鲸鱼标识。
+[MIT](LICENSE)。社区封装，与 DeepSeek 官方无隶属关系；图标为 DeepSeek 官方鲸鱼标识。

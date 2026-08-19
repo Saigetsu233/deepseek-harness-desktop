@@ -1,0 +1,27 @@
+{
+  "name": "token-cost",
+  "version": "1.0.0",
+  "description": "DeepSeek token cost tracker for the DSH Web UI: daily spend with peak/off-peak pricing",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "license": "MIT"
+}

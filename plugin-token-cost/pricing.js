@@ -1,5 +1,3 @@
-'use strict';
-
 /**
  * DeepSeek V4 峰谷计价模块（纯计算，不依赖 DSH/Electron，便于单测）。
  *
@@ -16,11 +14,11 @@
  *     高峰 命中 ¥0.30 / 未命中 ¥9.0 / 输出 ¥27.0。）
  */
 
-// 高峰时段（北京时间小时，[start, end)），可按官方后续公告在配置里改
-const PEAK_WINDOW = { start: 9, end: 14 };
-const BEIJING_UTC_OFFSET = 8;
+/** 高峰时段（北京时间小时，[start, end)），可按官方后续公告修改 */
+export const PEAK_WINDOW = { start: 9, end: 14 };
+export const BEIJING_UTC_OFFSET = 8;
 
-const PRICING = {
+export const PRICING = {
   'deepseek-v4-flash': {
     peak: { inputMiss: 3.0, inputHit: 0.1, output: 9.0 },
     idle: { inputMiss: 1.5, inputHit: 0.05, output: 4.5 },
@@ -36,7 +34,7 @@ const PRICING = {
  * @param {string} model 会话模型名（如 deepseek-v4-flash）
  * @returns {string|null} 定价档位 key
  */
-function matchModel(model) {
+export function matchModel(model) {
   const m = String(model || '').toLowerCase();
   if (m.includes('v4-pro') || m.includes('pro')) return 'deepseek-v4-pro';
   if (m.includes('v4-flash') || m.includes('flash')) return 'deepseek-v4-flash';
@@ -46,18 +44,18 @@ function matchModel(model) {
 }
 
 /** 北京时间小时（0-23） */
-function beijingHour(date = new Date()) {
+export function beijingHour(date = new Date()) {
   return (date.getUTCHours() + BEIJING_UTC_OFFSET) % 24;
 }
 
 /** 当前是否为高峰时段（按配置窗口，北京时间） */
-function isPeak(date = new Date()) {
+export function isPeak(date = new Date()) {
   const h = beijingHour(date);
   return h >= PEAK_WINDOW.start && h < PEAK_WINDOW.end;
 }
 
 /** 获取某档位在给定时刻的单价（¥/M tokens）；未知模型返回 null */
-function rateFor(model, date = new Date()) {
+export function rateFor(model, date = new Date()) {
   const key = matchModel(model);
   if (!key) return null;
   return PRICING[key][isPeak(date) ? 'peak' : 'idle'];
@@ -70,7 +68,7 @@ function rateFor(model, date = new Date()) {
  * @param {{inputMiss?:number,inputHit?:number,output?:number}} usage token 数
  * @returns {number|null} 花费（¥），未知模型返回 null
  */
-function costFor(model, date, usage) {
+export function costFor(model, date, usage) {
   const r = rateFor(model, date);
   if (!r) return null;
   const miss = usage.inputMiss ?? usage.input ?? 0;
@@ -78,5 +76,3 @@ function costFor(model, date, usage) {
   const out = usage.output ?? 0;
   return (miss / 1e6) * r.inputMiss + (hit / 1e6) * r.inputHit + (out / 1e6) * r.output;
 }
-
-module.exports = { PRICING, PEAK_WINDOW, BEIJING_UTC_OFFSET, matchModel, beijingHour, isPeak, rateFor, costFor };

@@ -29,7 +29,7 @@
  */
 
 const { app, BrowserWindow, dialog, Menu, nativeImage, screen, shell, Tray } = require('electron');
-const { spawn, execFileSync } = require('node:child_process');
+const { spawn, spawnSync, execFileSync } = require('node:child_process');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -51,6 +51,26 @@ function log(...args) {
 }
 
 // ── 配置 ────────────────────────────────────────────────────────────────────
+/**
+ * 默认工作区探测：读取 $DSH_HOME/storages/workspace.json，
+ * 取最近使用的工作区路径（即 dsh 上次实际运行/用户上次工作的目录），
+ * 这样桌面应用自启的服务和用户原工作区一致，重启后会话不会"消失"。
+ */
+function detectDefaultWorkspace() {
+  try {
+    const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+    const f = path.join(dshHome, 'storages', 'workspace.json');
+    if (!fs.existsSync(f)) return '';
+    const data = JSON.parse(fs.readFileSync(f, 'utf8'));
+    const ids = data?.global?.workspaceIds || [];
+    for (const id of ids) {
+      const ws = data?.tables?.workspaces?.[id];
+      if (ws?.path && fs.existsSync(ws.path)) return ws.path;
+    }
+  } catch { /* 忽略，回退默认 */ }
+  return '';
+}
+
 function loadConfig() {
   const userData = app.getPath('userData');
   const file = path.join(userData, 'config.json');
@@ -64,7 +84,11 @@ function loadConfig() {
     }
   }
   const port = Number(process.env.DSH_DESKTOP_PORT ?? cfg.port ?? DEFAULT_PORT);
-  const workspace = process.env.DSH_DESKTOP_WORKSPACE ?? cfg.workspace ?? os.homedir();
+  // workspace：显式配置/环境变量 > 最近使用的工作区 > 用户主目录
+  const explicitWorkspace = process.env.DSH_DESKTOP_WORKSPACE !== undefined || cfg.workspace !== undefined;
+  const detected = explicitWorkspace ? '' : detectDefaultWorkspace();
+  const workspace = process.env.DSH_DESKTOP_WORKSPACE ?? cfg.workspace ?? detected ?? os.homedir();
+  if (!explicitWorkspace && detected) log(`工作区未配置，自动采用最近使用的工作区：${detected}`);
   // dshCommand：显式指定（含环境变量）则尊重；否则走"自动"（本地安装 → PATH → 自动安装）
   const explicitDsh = process.env.DSH_DESKTOP_COMMAND !== undefined || cfg.dshCommand !== undefined;
   const dshCommand = explicitDsh ? (process.env.DSH_DESKTOP_COMMAND ?? cfg.dshCommand ?? 'dsh') : 'auto';
@@ -184,23 +208,102 @@ async function autoInstallDsh() {
   return ok && !!localDshCmd();
 }
 
-/** 解析最终使用的 dsh 命令（自动模式：本地 → PATH → 自动安装） */
+/** 从某个路径向上找最近的 node_modules 目录 */
+function findNodeModulesUp(fromDir) {
+  let cur = fromDir;
+  for (let i = 0; i < 12; i++) {
+    const nm = path.join(cur, 'node_modules');
+    if (fs.existsSync(nm)) return nm;
+    const parent = path.dirname(cur);
+    if (parent === cur) return '';
+    cur = parent;
+  }
+  return '';
+}
+
+/** 根据解析出的 dsh 命令，推导其安装目录下的 node_modules（插件部署目标） */
+function dshNodeModulesDirOf(command) {
+  try {
+    if (command && command !== 'dsh') {
+      if (fs.existsSync(command)) return findNodeModulesUp(path.dirname(command));
+    }
+    const r = spawnSync('where', ['dsh'], { shell: true, windowsHide: true, encoding: 'utf8' });
+    if (r.status === 0 && r.stdout) {
+      const first = r.stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean);
+      if (first && fs.existsSync(first)) return findNodeModulesUp(path.dirname(first));
+    }
+  } catch { /* 忽略 */ }
+  return '';
+}
+
+const PLUGIN_SRC = path.join(__dirname, 'plugin-token-cost');
+
+/** 用户 dsh 主目录（$DSH_HOME 或 ~/.dsh） */
+function dshHomeDir() {
+  return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+}
+
+/**
+ * 安装 token-cost 插件（作为 profile bundle，这是 dsh 官方支持的第三方插件方式）：
+ * 1. 把插件包复制到两处（都先删后拷，避免复制目录时嵌套）：
+ *    - dsh 安装目录 node_modules（loader 裸包名解析 + 浏览器 manifest 扫描）
+ *    - $DSH_HOME/profiles/web/node_modules（loader 的 profile 链解析）
+ * 2. 把 "token-cost" 注册进 profile 的 dsh.profile.bundles，其 dsh.bundle.patch
+ *    会把自己的 host/client 行插入组合树。
+ * 失败不致命：应用照常可用，仅无费用统计插件。
+ */
+function deployPlugins(dshNodeModulesDir) {
+  try {
+    if (!fs.existsSync(PLUGIN_SRC)) return false;
+    const targets = [];
+    if (dshNodeModulesDir && fs.existsSync(dshNodeModulesDir)) {
+      targets.push(path.join(dshNodeModulesDir, 'token-cost'));
+    }
+    const profileDir = path.join(dshHomeDir(), 'profiles', 'web');
+    targets.push(path.join(profileDir, 'node_modules', 'token-cost'));
+    for (const t of targets) {
+      fs.rmSync(t, { recursive: true, force: true });
+      fs.cpSync(PLUGIN_SRC, t, { recursive: true });
+    }
+    // 注册进 profile bundles（幂等）
+    const manifestPath = path.join(profileDir, 'package.json');
+    if (fs.existsSync(manifestPath)) {
+      const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      m.dsh = m.dsh || {};
+      m.dsh.profile = m.dsh.profile || {};
+      m.dsh.profile.bundles = m.dsh.profile.bundles || [];
+      if (!m.dsh.profile.bundles.includes('token-cost')) {
+        m.dsh.profile.bundles.push('token-cost');
+        fs.writeFileSync(manifestPath, JSON.stringify(m, null, 2));
+      }
+    }
+    log('已安装 token-cost 插件（profile bundle）');
+    return true;
+  } catch (e) {
+    log('安装 token-cost 插件失败（应用仍可正常使用）:', e.message);
+    return false;
+  }
+}
+
+/** 解析最终使用的 dsh 命令（自动模式：本地安装 → PATH → 自动安装） */
 async function resolveDshCommand(cfg) {
-  if (cfg.dshCommand !== 'auto') return cfg.dshCommand;
+  if (cfg.dshCommand !== 'auto') {
+    return { command: cfg.dshCommand, nodeModulesDir: dshNodeModulesDirOf(cfg.dshCommand) };
+  }
   const local = localDshCmd();
   if (local && (await dshExists(local))) {
     log(`使用应用自带的 DSH：${local}`);
-    return local;
+    return { command: local, nodeModulesDir: findNodeModulesUp(path.dirname(local)) };
   }
   if (await dshExists('dsh')) {
     log('检测到系统已安装 dsh');
-    return 'dsh';
+    return { command: 'dsh', nodeModulesDir: dshNodeModulesDirOf('dsh') };
   }
   log('未检测到 dsh，尝试自动安装…');
   if (await autoInstallDsh()) {
     const cmd = localDshCmd();
     log(`自动安装完成，DSH 位于：${cmd}`);
-    return cmd;
+    return { command: cmd, nodeModulesDir: findNodeModulesUp(path.dirname(cmd)) };
   }
   return null;
 }
@@ -239,9 +342,10 @@ async function ensureServer(cfg) {
   }
 
   // 2) 启动自己的 dsh web
+  const spawnArgs = ['web', '--port', String(cfg.port)];
   log(`启动 dsh web（端口 ${cfg.port}，workspace "${cfg.workspace}"，命令 "${cfg.dshCommand}"）`);
   let spawnFailed = false;
-  serverChild = spawn(cfg.dshCommand, ['web', '--port', String(cfg.port)], {
+  serverChild = spawn(cfg.dshCommand, spawnArgs, {
     cwd: cfg.workspace,
     shell: true,
     windowsHide: true,
@@ -264,12 +368,8 @@ async function ensureServer(cfg) {
     log('无法启动 dsh 进程:', err.message);
   });
   serverChild.on('exit', (code) => {
-    log(`dsh 进程退出，code=${code}`);
-    if (ownsServer && !quitting && code !== 0) {
-      showFatal(`dsh web 启动失败（退出码 ${code}）。\n\n` +
-        `请先在命令行手动执行 "${cfg.dshCommand} web" 确认可用。\n` +
-        `最近输出：\n${tail(out)}`);
-    }
+    // 退出原因留档；自愈监控会负责重启（见 startMonitor）
+    log(`dsh 进程退出，code=${code}。最近输出：\n${tail(out)}`);
     if (ownsServer) { serverChild = null; ownsServer = false; }
   });
 
@@ -289,6 +389,53 @@ async function ensureServer(cfg) {
     await sleep(500);
   }
   throw new Error(`等待 DSH Web 服务超时（${READY_TIMEOUT_MS / 1000}s）。\n最近输出：\n${tail(out)}`);
+}
+
+// ── 服务自愈：健康检查 + 自动重启 ───────────────────────────────────────────
+/** 轻量探测：端口有 HTTP 响应即认为存活（不校验页面内容） */
+function lightProbe(port, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port, path: '/', timeout: timeoutMs }, (res) => {
+      res.resume();
+      resolve(res.statusCode < 500);
+    });
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(false));
+  });
+}
+
+let monitorTimer = null;
+let monitorFails = 0;
+
+/**
+ * 每 5 秒检查一次服务；连续 3 次(约15秒)探测失败就自动重启服务并刷新窗口。
+ * 这样 dsh 服务进程无论因何崩溃（含工具调用期间），都会自动拉起，
+ * 不会再出现"断开后没有重启"。
+ */
+function startMonitor(cfg, getUrl) {
+  if (monitorTimer) clearInterval(monitorTimer);
+  monitorFails = 0;
+  monitorTimer = setInterval(async () => {
+    if (quitting) return;
+    const alive = await lightProbe(cfg.port);
+    if (alive) { monitorFails = 0; return; }
+    monitorFails++;
+    if (monitorFails < 3) return;
+    monitorFails = 0;
+    log('检测到 DSH 服务不可用，自动重启中…');
+    try {
+      if (serverChild) { try { serverChild.kill(); } catch {} }
+      serverChild = null;
+      ownsServer = false;
+      const url = await ensureServer(cfg);
+      log(`DSH 服务已自动重启：${url}`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.loadURL(url).catch((e) => log('重启后刷新页面失败:', e.message));
+      }
+    } catch (e) {
+      log('自动重启失败，继续监控重试:', e.message);
+    }
+  }, 5000);
 }
 
 // ── 窗口 ────────────────────────────────────────────────────────────────────
@@ -447,16 +594,13 @@ function createWindow(url, cfg) {
     applyCustomizations(win, cfg).catch((e) => log('应用自定义样式失败:', e.message));
   });
 
-  // 加载失败自动重试（最多 5 次，等 3 秒再试；忽略主动跳转的 -3 中止）
-  let failCount = 0;
+  // 加载失败持续重试（应用运行期间一直重试，配合服务自愈；忽略主动跳转的 -3 中止）
   win.webContents.on('did-fail-load', (_e, code, desc, failedUrl, isMainFrame) => {
     if (!isMainFrame || code === -3) return;
-    log(`页面加载失败 (${code}) ${desc}：${failedUrl}`);
-    if (!quitting && mainWindow && !mainWindow.isDestroyed() && failCount < 5) {
-      failCount++;
+    log(`页面加载失败 (${code}) ${desc}：${failedUrl}，3 秒后重试`);
+    if (!quitting) {
       setTimeout(() => {
         if (mainWindow && !mainWindow.isDestroyed() && !win.webContents.isLoading()) {
-          log(`自动重试加载（第 ${failCount} 次）…`);
           win.webContents.reload();
         }
       }, 3000);
@@ -542,7 +686,8 @@ if (!gotLock) {
       app.exit(1);
       return;
     }
-    cfg.dshCommand = dsh;
+    cfg.dshCommand = dsh.command;
+    deployPlugins(dsh.nodeModulesDir);
 
     let url;
     try {
@@ -556,6 +701,7 @@ if (!gotLock) {
 
     mainWindow = createWindow(url, cfg);
     createTray(iconPathFor(cfg));
+    startMonitor(cfg, () => url);
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow(url, cfg);
@@ -575,6 +721,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   quitting = true;
+  if (monitorTimer) clearInterval(monitorTimer);
   killServerTree();
   try { tray?.destroy(); } catch { /* 忽略 */ }
 });
