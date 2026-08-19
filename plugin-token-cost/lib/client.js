@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
 		}
 
 		// ── 账本（localStorage 持久化，按北京时间分天 + 高峰/低谷分桶）─────────────
-		const LS_KEY = "token-cost-ledger-v1";
+		const LS_KEY = "token-cost-ledger-v2";
 		let ledger = loadLedger();
 		const listeners = new Set();
 		function emptyLedger() { return { sessions: {}, days: {} }; }
@@ -94,11 +94,17 @@ window.__ModuleLoader__.load({
 						changed = true;
 						continue;
 					}
-					const dMiss = prev ? u.miss - prev.miss : u.miss;
-					const dHit = prev ? u.hit - prev.hit : u.hit;
-					const dOut = prev ? u.out - prev.out : u.out;
-					if (!prev) { ledger.sessions[sid] = { miss: u.miss, hit: u.hit, out: u.out, model: null }; changed = true; }
-					else { ledger.sessions[sid] = { miss: u.miss, hit: u.hit, out: u.out, model: prev.model }; }
+					if (!prev) {
+						// 首次见到该会话：只建立基线，不计费
+						// （其历史用量发生在插件安装/账本初始化之前，不该算进今天的花费）
+						ledger.sessions[sid] = { miss: u.miss, hit: u.hit, out: u.out, model: null };
+						changed = true;
+						continue;
+					}
+					const dMiss = u.miss - prev.miss;
+					const dHit = u.hit - prev.hit;
+					const dOut = u.out - prev.out;
+					ledger.sessions[sid] = { miss: u.miss, hit: u.hit, out: u.out, model: prev.model };
 					if (dMiss + dHit + dOut <= 0) continue;
 					let model = ledger.sessions[sid].model;
 					if (!model) { model = await fetchModel(api, sid); ledger.sessions[sid].model = model; }
