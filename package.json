@@ -1,0 +1,53 @@
+{
+  "name": "dsh-desktop",
+  "productName": "DSH Desktop",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness Web UI desktop shell (Electron): starts `dsh web` and shows it in a native window",
+  "main": "main.js",
+  "author": "JIANG",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Saigetsu233/deepseek-harness-desktop.git"
+  },
+  "homepage": "https://github.com/Saigetsu233/deepseek-harness-desktop",
+  "bugs": {
+    "url": "https://github.com/Saigetsu233/deepseek-harness-desktop/issues"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win",
+    "gen-icon": "node scripts/gen-icon.mjs"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.deepseek.dsh.desktop",
+    "productName": "DSH Desktop",
+    "files": [
+      "main.js",
+      "package.json",
+      "build/**"
+    ],
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "portable": {
+      "artifactName": "DSH-Desktop-${version}.exe"
+    }
+  }
+}

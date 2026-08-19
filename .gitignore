@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.npm-cache/
+.electron-cache/
+smoke-run.log
