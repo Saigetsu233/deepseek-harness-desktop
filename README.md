@@ -1,7 +1,16 @@
 # DSH Desktop
 
+[![GitHub release](https://img.shields.io/github/v/release/Saigetsu233/deepseek-harness-desktop)](https://github.com/Saigetsu233/deepseek-harness-desktop/releases)
+[![License](https://img.shields.io/github/license/Saigetsu233/deepseek-harness-desktop)](LICENSE)
+
 DeepSeek Harness Web UI 的桌面版（Electron 封装）。双击打开一个原生窗口，
 自动帮你启动/复用本地的 `dsh web` 服务。
+
+## 下载发布版
+
+在 [Releases](https://github.com/Saigetsu233/deepseek-harness-desktop/releases)
+页面下载 `DSH-Desktop-<版本>.exe`（portable 单文件，双击即用，无需安装）。
+每次打 tag（`v*`）都会由 GitHub Actions 自动重新打包并发布。
 
 ## 它能做什么
 
