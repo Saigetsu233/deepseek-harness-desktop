@@ -123,6 +123,23 @@ function probe(port, timeoutMs = PROBE_TIMEOUT_MS) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** 给含空格的参数加引号（供 shell:true 的 spawn 使用，避免路径被空格截断） */
+function q(s) {
+  return /\s/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s;
+}
+
+/** 用 where 解析可执行文件全路径（Windows） */
+function resolveExecutable(name) {
+  try {
+    const r = spawnSync('where', [name], { shell: true, windowsHide: true, encoding: 'utf8' });
+    if (r.status === 0 && r.stdout) {
+      const first = r.stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean);
+      if (first) return first;
+    }
+  } catch { /* 忽略 */ }
+  return '';
+}
+
 function tail(lines, n = 20) {
   return lines.slice(-n).join('\n');
 }
@@ -185,9 +202,17 @@ async function autoInstallDsh() {
     if (win.isDestroyed()) return;
     win.webContents.executeJavaScript(`appendLog(${JSON.stringify(String(t).slice(0, 400))})`).catch(() => {});
   };
-  showLog('正在执行：npm install -g 等价本地安装 @deepseek-ai/dsh …');
+  showLog('正在执行：本地安装 @deepseek-ai/dsh …');
   const ok = await new Promise((resolve) => {
-    const child = spawn('npm', ['install', '--prefix', dir, '--no-audit', '--no-fund', '@deepseek-ai/dsh'], {
+    const npmCmd = resolveExecutable('npm.cmd') || resolveExecutable('npm');
+    if (!npmCmd) {
+      showLog('找不到 npm，请先安装 Node.js（https://nodejs.org）后重试。');
+      resolve(false);
+      return;
+    }
+    // 显式给每个含空格的参数加引号（--prefix 目标目录含空格，shell 拼接时会截断）
+    const cmdline = [q(npmCmd), 'install', '--prefix', q(dir), '--no-audit', '--no-fund', '@deepseek-ai/dsh'].join(' ');
+    const child = spawn(cmdline, {
       shell: true,
       windowsHide: true,
       env: { ...process.env, npm_config_cache: path.join(dir, '.npm-cache') },
@@ -196,7 +221,6 @@ async function autoInstallDsh() {
     child.stderr?.on('data', (d) => showLog(d.toString()));
     child.on('error', (err) => {
       showLog('无法启动 npm：' + err.message);
-      showLog('请先安装 Node.js（https://nodejs.org）后重试。');
       resolve(false);
     });
     child.on('exit', (code) => {
@@ -285,19 +309,36 @@ function deployPlugins(dshNodeModulesDir) {
   }
 }
 
-/** 解析最终使用的 dsh 命令（自动模式：本地安装 → PATH → 自动安装） */
+/** 候选 dsh 命令：应用自带 → PATH → npm 全局 → npx 缓存（双击环境里 PATH 可能不含 npx） */
+function dshCandidates() {
+  const list = [];
+  const local = localDshCmd();
+  if (local) list.push(local);
+  list.push('dsh');
+  const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  list.push(path.join(appData, 'npm', 'node_modules', '.bin', 'dsh.cmd'));
+  const localData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  const npxRoot = path.join(localData, 'npm-cache', '_npx');
+  try {
+    if (fs.existsSync(npxRoot)) {
+      for (const name of fs.readdirSync(npxRoot)) {
+        list.push(path.join(npxRoot, name, 'node_modules', '.bin', 'dsh.cmd'));
+      }
+    }
+  } catch { /* 忽略 */ }
+  return list;
+}
+
+/** 解析最终使用的 dsh 命令（自动模式：自带 → PATH → npm 全局 → npx 缓存 → 自动安装） */
 async function resolveDshCommand(cfg) {
   if (cfg.dshCommand !== 'auto') {
     return { command: cfg.dshCommand, nodeModulesDir: dshNodeModulesDirOf(cfg.dshCommand) };
   }
-  const local = localDshCmd();
-  if (local && (await dshExists(local))) {
-    log(`使用应用自带的 DSH：${local}`);
-    return { command: local, nodeModulesDir: findNodeModulesUp(path.dirname(local)) };
-  }
-  if (await dshExists('dsh')) {
-    log('检测到系统已安装 dsh');
-    return { command: 'dsh', nodeModulesDir: dshNodeModulesDirOf('dsh') };
+  for (const cand of dshCandidates()) {
+    if (await dshExists(cand)) {
+      log(`使用 dsh：${cand}`);
+      return { command: cand, nodeModulesDir: dshNodeModulesDirOf(cand) };
+    }
   }
   log('未检测到 dsh，尝试自动安装…');
   if (await autoInstallDsh()) {
@@ -345,35 +386,36 @@ async function ensureServer(cfg) {
   const spawnArgs = ['web', '--port', String(cfg.port)];
   log(`启动 dsh web（端口 ${cfg.port}，workspace "${cfg.workspace}"，命令 "${cfg.dshCommand}"）`);
   let spawnFailed = false;
-  serverChild = spawn(cfg.dshCommand, spawnArgs, {
+  const child = spawn(q(cfg.dshCommand), spawnArgs, {
     cwd: cfg.workspace,
     shell: true,
     windowsHide: true,
   });
+  serverChild = child;
   ownsServer = true;
 
   const out = [];
-  serverChild.stdout?.on('data', (d) => {
+  child.stdout?.on('data', (d) => {
     const s = d.toString();
     out.push(s);
     log('[dsh]', s.trimEnd());
   });
-  serverChild.stderr?.on('data', (d) => {
+  child.stderr?.on('data', (d) => {
     const s = d.toString();
     out.push(s);
     log('[dsh]', s.trimEnd());
   });
-  serverChild.on('error', (err) => {
+  child.on('error', (err) => {
     spawnFailed = true;
     log('无法启动 dsh 进程:', err.message);
   });
-  serverChild.on('exit', (code) => {
+  child.on('exit', (code) => {
     // 退出原因留档；自愈监控会负责重启（见 startMonitor）
     log(`dsh 进程退出，code=${code}。最近输出：\n${tail(out)}`);
     if (ownsServer) { serverChild = null; ownsServer = false; }
   });
 
-  // 3) 等待端口就绪
+  // 3) 等待端口就绪（用局部 child 引用，避免 exit 回调置空 serverChild 后空指针）
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (await probe(cfg.port)) {
@@ -383,8 +425,8 @@ async function ensureServer(cfg) {
     if (spawnFailed) {
       throw new Error(`无法启动 "${cfg.dshCommand}"。请确认 dsh 已安装且在 PATH 中（命令行执行 ${cfg.dshCommand} 测试）。`);
     }
-    if (serverChild.exitCode !== null) {
-      throw new Error(`dsh web 提前退出（code ${serverChild.exitCode}）。\n最近输出：\n${tail(out)}`);
+    if (child.exitCode !== null) {
+      throw new Error(`dsh web 提前退出（code ${child.exitCode}）。\n最近输出：\n${tail(out)}`);
     }
     await sleep(500);
   }
