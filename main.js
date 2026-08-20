@@ -4,12 +4,12 @@
  * DSH Desktop — DeepSeek Harness Web UI 的桌面壳（Electron）。
  *
  * 职责：
- *  1. 检测 http://127.0.0.1:<port> 是否已有 DSH Web 服务在运行（例如你已手动
- *     启动过 `dsh web`）。有则直接复用，不重复启动、退出时也不去停它。
+ *  1. 仅通过 HMAC challenge 检测同一桌面实例的 DSH Web 服务；旧版/其他服务
+ *     占用端口时切换到随机 loopback 端口，避免加载伪造页面。
  *  2. dsh 命令自动就绪：检测顺序为 应用自带安装 → 系统 PATH → 都没有则弹出
- *     进度窗口自动 npm 安装（装到应用用户目录，无需管理员权限）。
- *  3. 启动 `dsh web --port <port>`（配置的工作目录作为 workspace 根），
- *     等端口就绪后打开窗口；关闭窗口=隐藏到托盘继续后台运行，
+ *     进度窗口安装固定版本（装到应用用户目录，无需管理员权限）。
+ *  3. 启动 `dsh web --no-open --host 127.0.0.1 --port <port>`（配置的工作目录作为 workspace 根），
+ *     Electron 为所有请求注入 desktop token；关闭窗口=隐藏到托盘继续后台运行，
  *     只有托盘菜单"退出"才真正退出并停止自启的 dsh 进程（连同子进程）。
  *  4. 渲染进程崩溃/页面加载失败会自动重载恢复，不会整个窗口消失。
  *
@@ -29,14 +29,22 @@
  */
 
 const { app, BrowserWindow, dialog, Menu, nativeImage, screen, shell, Tray } = require('electron');
-const { spawn, spawnSync, execFileSync } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
+const crypto = require('node:crypto');
 const http = require('node:http');
+const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 
 const DEFAULT_PORT = 3080;
+const DSH_VERSION = '0.1.0-rc.7';
+const DSH_INTEGRITY = 'sha512-ZceDCJ8FAywih+USW/OMk9jEhunlvJBGEz4kqrhau23hPzbciOazZrywH0nBRsaalSeAJ1JGBmjtw4OSjToStw==';
+const PLUGIN_SOURCE_SHA256 = '32689f2f9b7310122b3ef2361bd33415ec316bdc1412381d80ddfd1c3029687d';
+const DESKTOP_AUTH_FILE = 'desktop-auth-token';
+const DESKTOP_AUTH_HEADER = 'x-dsh-desktop-token';
+const DESKTOP_AUTH_PATH = '/__dsh_desktop_auth';
 const READY_TIMEOUT_MS = 90 * 1000; // 等待 dsh 启动就绪的最长时间
 const PROBE_TIMEOUT_MS = 1500;      // 每次探测端口的超时
 
@@ -100,19 +108,47 @@ function loadConfig() {
   return { port, workspace, dshCommand, icon, backgroundImage, backgroundDim, customCss, windowBackground, configFile: file };
 }
 
-// ── 端口探测：确认是「DeepSeek Harness」本尊而不是别的服务 ─────────────────
-function probe(port, timeoutMs = PROBE_TIMEOUT_MS) {
+// ── 服务身份握手：不再依赖首页文本识别服务 ────────────────────────────────────
+function getDesktopAuthToken() {
+  const file = path.join(app.getPath('userData'), DESKTOP_AUTH_FILE);
+  try {
+    const token = fs.readFileSync(file, 'utf8').trim();
+    if (/^[a-f0-9]{64}$/i.test(token)) return token.toLowerCase();
+  } catch { /* 首次运行 */ }
+  const token = crypto.randomBytes(32).toString('hex');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${token}\n`, { encoding: 'utf8', mode: 0o600 });
+  return token;
+}
+
+function authProof(token, challenge) {
+  return crypto.createHmac('sha256', Buffer.from(token, 'hex')).update(challenge).digest('hex');
+}
+
+function probe(port, token, timeoutMs = PROBE_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    const req = http.get({ host: '127.0.0.1', port, path: '/', timeout: timeoutMs }, (res) => {
+    const challenge = crypto.randomBytes(24).toString('hex');
+    const req = http.get({
+      host: '127.0.0.1', port,
+      path: `${DESKTOP_AUTH_PATH}?challenge=${challenge}`,
+      timeout: timeoutMs,
+      headers: { accept: 'application/json' },
+    }, (res) => {
       const chunks = [];
       let size = 0;
       res.on('data', (c) => {
         size += c.length;
-        if (size < 128 * 1024) chunks.push(c); else req.destroy();
+        if (size <= 16 * 1024) chunks.push(c); else req.destroy();
       });
       res.on('end', () => {
-        const body = Buffer.concat(chunks).toString('utf8');
-        resolve(res.statusCode >= 200 && res.statusCode < 500 && /DeepSeek Harness/i.test(body));
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          const expected = authProof(token, challenge);
+          const actual = Buffer.from(String(body?.proof || ''));
+          const expectedBuffer = Buffer.from(expected);
+          resolve(res.statusCode === 200 && body?.service === 'dsh-desktop' &&
+            actual.length === expectedBuffer.length && crypto.timingSafeEqual(actual, expectedBuffer));
+        } catch { resolve(false); }
       });
       res.on('error', () => resolve(false));
     });
@@ -121,22 +157,58 @@ function probe(port, timeoutMs = PROBE_TIMEOUT_MS) {
   });
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** 给含空格的参数加引号（供 shell:true 的 spawn 使用，避免路径被空格截断） */
-function q(s) {
-  return /\s/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s;
+function isTcpPortOpen(port, timeoutMs = PROBE_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    let settled = false;
+    const finish = (value) => { if (!settled) { settled = true; socket.destroy(); resolve(value); } };
+    socket.setTimeout(timeoutMs, () => finish(false));
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+  });
 }
 
-/** 用 where 解析可执行文件全路径（Windows） */
+function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      server.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Windows .cmd/.bat wrappers must use cmd.exe; all arguments remain fixed argv. */
+function spawnSafe(command, args, options = {}) {
+  const base = { ...options, shell: false, windowsHide: true };
+  if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(command)) {
+    if (/[&|<>^%\n\r]/.test(command)) throw new Error('可执行文件路径包含不允许的 Shell 字符');
+    const commandLine = `"${command}" ${args.map((arg) => {
+      const value = String(arg);
+      if (/^[a-zA-Z0-9_./:=+-]+$/.test(value)) return value;
+      if (/[&|<>^%\n\r]/.test(value)) throw new Error('命令参数包含不允许的 Shell 字符');
+      return `"${value.replace(/"/g, '\\"')}"`;
+    }).join(' ')}`;
+    return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', commandLine], base);
+  }
+  return spawn(command, args, base);
+}
+
+/** 按 PATH 查找可执行文件，不通过 Shell。 */
 function resolveExecutable(name) {
-  try {
-    const r = spawnSync('where', [name], { shell: true, windowsHide: true, encoding: 'utf8' });
-    if (r.status === 0 && r.stdout) {
-      const first = r.stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean);
-      if (first) return first;
+  const names = process.platform === 'win32' && !/\.(?:cmd|bat|exe)$/i.test(name)
+    ? [`${name}.cmd`, `${name}.exe`, name] : [name];
+  const pathValue = process.env.PATH || '';
+  for (const dir of pathValue.split(path.delimiter)) {
+    for (const candidate of names) {
+      const full = path.join(dir || '.', candidate);
+      try { if (fs.statSync(full).isFile()) return full; } catch { /* 继续 */ }
     }
-  } catch { /* 忽略 */ }
+  }
   return '';
 }
 
@@ -164,9 +236,7 @@ function dshExists(command, timeoutMs = 5000) {
     let done = false;
     const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
     try {
-      // 路径含空格时给 shell 加引号；普通命令名直接传
-      const cmd = /\s/.test(command) ? `"${command}"` : command;
-      const child = spawn(cmd, ['--help'], { shell: true, windowsHide: true, stdio: 'ignore' });
+      const child = spawnSafe(command, ['--help'], { stdio: 'ignore' });
       const timer = setTimeout(() => { try { child.kill(); } catch {} finish(false); }, timeoutMs);
       child.on('error', () => { clearTimeout(timer); finish(false); });
       child.on('exit', (code) => { clearTimeout(timer); finish(code === 0); });
@@ -202,20 +272,25 @@ async function autoInstallDsh() {
     if (win.isDestroyed()) return;
     win.webContents.executeJavaScript(`appendLog(${JSON.stringify(String(t).slice(0, 400))})`).catch(() => {});
   };
-  showLog('正在执行：本地安装 @deepseek-ai/dsh …');
+  showLog(`正在执行：安装固定版本 @deepseek-ai/dsh@${DSH_VERSION} …`);
   const ok = await new Promise((resolve) => {
-    const npmCmd = resolveExecutable('npm.cmd') || resolveExecutable('npm');
+    fs.mkdirSync(dir, { recursive: true });
+    const npmCmd = resolveExecutable('npm');
     if (!npmCmd) {
       showLog('找不到 npm，请先安装 Node.js（https://nodejs.org）后重试。');
       resolve(false);
       return;
     }
-    // 显式给每个含空格的参数加引号（--prefix 目标目录含空格，shell 拼接时会截断）
-    const cmdline = [q(npmCmd), 'install', '--prefix', q(dir), '--no-audit', '--no-fund', '@deepseek-ai/dsh'].join(' ');
-    const child = spawn(cmdline, {
-      shell: true,
-      windowsHide: true,
-      env: { ...process.env, npm_config_cache: path.join(dir, '.npm-cache') },
+    const child = spawnSafe(npmCmd, [
+      'install', '--no-audit', '--no-fund', '--ignore-scripts',
+      `@deepseek-ai/dsh@${DSH_VERSION}`,
+    ], {
+      cwd: dir,
+      env: {
+        ...process.env,
+        npm_config_cache: path.join(dir, '.npm-cache'),
+        npm_config_prefix: dir,
+      },
     });
     child.stdout?.on('data', (d) => showLog(d.toString()));
     child.stderr?.on('data', (d) => showLog(d.toString()));
@@ -224,40 +299,28 @@ async function autoInstallDsh() {
       resolve(false);
     });
     child.on('exit', (code) => {
-      showLog(code === 0 ? '安装完成 ✓' : '安装失败（退出码 ' + code + '）');
+      showLog(code === 0 ? '安装完成，开始校验 ✓' : '安装失败（退出码 ' + code + '）');
       resolve(code === 0);
     });
   });
   if (!win.isDestroyed()) win.destroy();
-  return ok && !!localDshCmd();
+  return ok && verifyDshInstall(dir) && !!localDshCmd();
 }
 
-/** 从某个路径向上找最近的 node_modules 目录 */
-function findNodeModulesUp(fromDir) {
-  let cur = fromDir;
-  for (let i = 0; i < 12; i++) {
-    const nm = path.join(cur, 'node_modules');
-    if (fs.existsSync(nm)) return nm;
-    const parent = path.dirname(cur);
-    if (parent === cur) return '';
-    cur = parent;
-  }
-  return '';
-}
-
-/** 根据解析出的 dsh 命令，推导其安装目录下的 node_modules（插件部署目标） */
-function dshNodeModulesDirOf(command) {
+function verifyDshInstall(dir) {
   try {
-    if (command && command !== 'dsh') {
-      if (fs.existsSync(command)) return findNodeModulesUp(path.dirname(command));
-    }
-    const r = spawnSync('where', ['dsh'], { shell: true, windowsHide: true, encoding: 'utf8' });
-    if (r.status === 0 && r.stdout) {
-      const first = r.stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean);
-      if (first && fs.existsSync(first)) return findNodeModulesUp(path.dirname(first));
-    }
-  } catch { /* 忽略 */ }
-  return '';
+    const packageFile = path.join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
+    const lockFile = path.join(dir, 'package-lock.json');
+    const pkg = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+    const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+    const entry = lock.packages?.['node_modules/@deepseek-ai/dsh'];
+    const ok = pkg.version === DSH_VERSION && entry?.version === DSH_VERSION && entry?.integrity === DSH_INTEGRITY;
+    if (!ok) log(`DSH 完整性校验失败（期望 ${DSH_VERSION} / ${DSH_INTEGRITY}）`);
+    return ok;
+  } catch (e) {
+    log('DSH 完整性校验失败:', e.message);
+    return false;
+  }
 }
 
 // 插件源目录：开发模式在项目目录；打包后通过 extraResources 放在 asar 外的 resources 目录
@@ -271,41 +334,82 @@ function dshHomeDir() {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 }
 
-/**
- * 安装 token-cost 插件（作为 profile bundle，这是 dsh 官方支持的第三方插件方式）：
- * 1. 把插件包复制到两处（都先删后拷，避免复制目录时嵌套）：
- *    - dsh 安装目录 node_modules（loader 裸包名解析 + 浏览器 manifest 扫描）
- *    - $DSH_HOME/profiles/web/node_modules（loader 的 profile 链解析）
- * 2. 把 "token-cost" 注册进 profile 的 dsh.profile.bundles，其 dsh.bundle.patch
- *    会把自己的 host/client 行插入组合树。
- * 失败不致命：应用照常可用，仅无费用统计插件。
- */
-function deployPlugins(dshNodeModulesDir) {
-  try {
-    if (!fs.existsSync(PLUGIN_SRC)) return false;
-    const targets = [];
-    if (dshNodeModulesDir && fs.existsSync(dshNodeModulesDir)) {
-      targets.push(path.join(dshNodeModulesDir, 'token-cost'));
-    }
-    const profileDir = path.join(dshHomeDir(), 'profiles', 'web');
-    targets.push(path.join(profileDir, 'node_modules', 'token-cost'));
-    for (const t of targets) {
-      fs.rmSync(t, { recursive: true, force: true });
-      fs.cpSync(PLUGIN_SRC, t, { recursive: true });
-    }
-    // 注册进 profile bundles（幂等）
-    const manifestPath = path.join(profileDir, 'package.json');
-    if (fs.existsSync(manifestPath)) {
-      const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-      m.dsh = m.dsh || {};
-      m.dsh.profile = m.dsh.profile || {};
-      m.dsh.profile.bundles = m.dsh.profile.bundles || [];
-      if (!m.dsh.profile.bundles.includes('token-cost')) {
-        m.dsh.profile.bundles.push('token-cost');
-        fs.writeFileSync(manifestPath, JSON.stringify(m, null, 2));
+/** 计算插件目录的确定性 hash，并拒绝源目录中的符号链接。 */
+function directoryDigest(root) {
+  const hash = crypto.createHash('sha256');
+  const walk = (dir, relative = '') => {
+    for (const name of fs.readdirSync(dir).sort()) {
+      const full = path.join(dir, name);
+      const rel = path.join(relative, name);
+      const stat = fs.lstatSync(full);
+      if (stat.isSymbolicLink()) throw new Error(`插件包含不允许的符号链接：${rel}`);
+      if (stat.isDirectory()) walk(full, rel);
+      else if (stat.isFile()) {
+        hash.update(rel.replaceAll(path.sep, '/')); hash.update('\0');
+        const content = fs.readFileSync(full);
+        hash.update(/\.(?:js|json|yml|yaml|md)$/i.test(rel)
+          ? content.toString('utf8').replace(/\r\n/g, '\n') : content);
+        hash.update('\0');
       }
     }
-    log('已安装 token-cost 插件（profile bundle）');
+  };
+  walk(root);
+  return hash.digest('hex');
+}
+
+/**
+ * 安装 token-cost 插件到 profile 私有目录：临时目录复制、hash 校验、原子替换，
+ * 不再覆盖 dsh 全局 node_modules；旧插件会保留为可回滚备份。
+ */
+function deployPlugins() {
+  try {
+    if (!fs.existsSync(PLUGIN_SRC) || !fs.statSync(PLUGIN_SRC).isDirectory()) return false;
+    const sourceHash = directoryDigest(PLUGIN_SRC);
+    if (sourceHash !== PLUGIN_SOURCE_SHA256) {
+      log(`内置插件 hash 不匹配，拒绝部署（${sourceHash}）`);
+      return false;
+    }
+    const profileDir = path.join(dshHomeDir(), 'profiles', 'web');
+    const modulesDir = path.join(profileDir, 'node_modules');
+    const target = path.join(modulesDir, 'token-cost');
+    fs.mkdirSync(modulesDir, { recursive: true });
+    const marker = path.join(target, '.dsh-desktop-plugin.json');
+    try {
+      const installed = JSON.parse(fs.readFileSync(marker, 'utf8'));
+      if (installed.sourceHash === sourceHash && installed.version === '1.4.0') {
+        log('token-cost 插件已是受校验版本');
+      } else {
+        throw new Error('plugin version changed');
+      }
+    } catch {
+      const temp = path.join(modulesDir, `.token-cost.tmp-${process.pid}`);
+      fs.rmSync(temp, { recursive: true, force: true });
+      fs.cpSync(PLUGIN_SRC, temp, { recursive: true, errorOnExist: true });
+      if (directoryDigest(temp) !== sourceHash) throw new Error('插件复制后 hash 校验失败');
+      fs.writeFileSync(path.join(temp, '.dsh-desktop-plugin.json'), JSON.stringify({
+        version: '1.4.0', sourceHash,
+      }, null, 2));
+      if (fs.existsSync(target)) {
+        const backup = `${target}.backup-${Date.now()}`;
+        fs.renameSync(target, backup);
+        log(`已保留旧 token-cost 插件备份：${backup}`);
+      }
+      fs.renameSync(temp, target);
+    }
+    // 注册进 profile bundles（幂等、原子写入）
+    const manifestPath = path.join(profileDir, 'package.json');
+    const m = fs.existsSync(manifestPath)
+      ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : { name: 'web', private: true };
+    m.dsh = m.dsh || {};
+    m.dsh.profile = m.dsh.profile || {};
+    m.dsh.profile.bundles = Array.isArray(m.dsh.profile.bundles) ? m.dsh.profile.bundles : [];
+    if (!m.dsh.profile.bundles.includes('token-cost')) {
+      m.dsh.profile.bundles.push('token-cost');
+      const tempManifest = `${manifestPath}.tmp-${process.pid}`;
+      fs.writeFileSync(tempManifest, JSON.stringify(m, null, 2));
+      fs.renameSync(tempManifest, manifestPath);
+    }
+    log('已安装并校验 token-cost 插件（profile bundle）');
     return true;
   } catch (e) {
     log('安装 token-cost 插件失败（应用仍可正常使用）:', e.message);
@@ -313,42 +417,53 @@ function deployPlugins(dshNodeModulesDir) {
   }
 }
 
-/** 候选 dsh 命令：应用自带 → PATH → npm 全局 → npx 缓存（双击环境里 PATH 可能不含 npx） */
+/** 候选 dsh 命令：应用自带 → PATH → npm 全局 → npx 缓存。 */
 function dshCandidates() {
   const list = [];
   const local = localDshCmd();
   if (local) list.push(local);
-  list.push('dsh');
+  const fromPath = resolveExecutable('dsh');
+  if (fromPath) list.push(fromPath);
   const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
-  list.push(path.join(appData, 'npm', 'node_modules', '.bin', 'dsh.cmd'));
+  const globalDsh = path.join(appData, 'npm', 'node_modules', '.bin', process.platform === 'win32' ? 'dsh.cmd' : 'dsh');
+  if (fs.existsSync(globalDsh)) list.push(globalDsh);
   const localData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
   const npxRoot = path.join(localData, 'npm-cache', '_npx');
   try {
     if (fs.existsSync(npxRoot)) {
       for (const name of fs.readdirSync(npxRoot)) {
-        list.push(path.join(npxRoot, name, 'node_modules', '.bin', 'dsh.cmd'));
+        const candidate = path.join(npxRoot, name, 'node_modules', '.bin', process.platform === 'win32' ? 'dsh.cmd' : 'dsh');
+        if (fs.existsSync(candidate)) list.push(candidate);
       }
     }
   } catch { /* 忽略 */ }
-  return list;
+  return [...new Set(list)];
 }
 
-/** 解析最终使用的 dsh 命令（自动模式：自带 → PATH → npm 全局 → npx 缓存 → 自动安装） */
+function resolveCommandPath(command) {
+  if (!command || /[&|<>^%\n\r]/.test(command)) return '';
+  try { if (path.isAbsolute(command) && fs.statSync(command).isFile()) return command; } catch { /* 继续 */ }
+  return resolveExecutable(command);
+}
+
+/** 解析最终使用的 dsh 命令（自动模式：自带 → PATH → 自动安装） */
 async function resolveDshCommand(cfg) {
   if (cfg.dshCommand !== 'auto') {
-    return { command: cfg.dshCommand, nodeModulesDir: dshNodeModulesDirOf(cfg.dshCommand) };
+    const command = resolveCommandPath(cfg.dshCommand);
+    if (!command || !(await dshExists(command))) return null;
+    return { command };
   }
   for (const cand of dshCandidates()) {
     if (await dshExists(cand)) {
       log(`使用 dsh：${cand}`);
-      return { command: cand, nodeModulesDir: dshNodeModulesDirOf(cand) };
+      return { command: cand };
     }
   }
   log('未检测到 dsh，尝试自动安装…');
   if (await autoInstallDsh()) {
     const cmd = localDshCmd();
     log(`自动安装完成，DSH 位于：${cmd}`);
-    return { command: cmd, nodeModulesDir: findNodeModulesUp(path.dirname(cmd)) };
+    return { command: cmd };
   }
   return null;
 }
@@ -379,21 +494,29 @@ async function ensureServer(cfg) {
   if (!Number.isInteger(cfg.port) || cfg.port < 1 || cfg.port > 65535) {
     throw new Error(`无效端口：${cfg.port}（应为 1-65535 的整数）`);
   }
+  if (!cfg.authToken) throw new Error('桌面服务认证 token 未生成，拒绝启动未认证服务');
 
-  // 1) 已有实例则复用
-  if (await probe(cfg.port)) {
-    log(`http://127.0.0.1:${cfg.port} 已有 DSH Web 服务，直接复用（退出时不会停止它）`);
-    return `http://127.0.0.1:${cfg.port}`;
+  let port = cfg.activePort || cfg.port;
+  // 只有通过 HMAC challenge 的同一桌面服务才允许复用。
+  if (await probe(port, cfg.authToken)) {
+    cfg.activePort = port;
+    log(`已通过桌面身份握手，复用 http://127.0.0.1:${port}`);
+    return `http://127.0.0.1:${port}`;
   }
+  // 固定端口被旧版/其他服务占用时，绝不加载它，改用 OS 分配的 loopback 端口。
+  if (await isTcpPortOpen(port)) {
+    const fallback = await getFreePort();
+    log(`端口 ${port} 被未认证服务占用，改用随机端口 ${fallback}`);
+    port = fallback;
+  }
+  cfg.activePort = port;
 
-  // 2) 启动自己的 dsh web
-  const spawnArgs = ['web', '--port', String(cfg.port)];
-  log(`启动 dsh web（端口 ${cfg.port}，workspace "${cfg.workspace}"，命令 "${cfg.dshCommand}"）`);
+  const spawnArgs = ['web', '--no-open', '--host', '127.0.0.1', '--port', String(port)];
+  log(`启动 dsh web（端口 ${port}，workspace "${cfg.workspace}"，命令 "${cfg.dshCommand}"）`);
   let spawnFailed = false;
-  const child = spawn(q(cfg.dshCommand), spawnArgs, {
+  const child = spawnSafe(cfg.dshCommand, spawnArgs, {
     cwd: cfg.workspace,
-    shell: true,
-    windowsHide: true,
+    env: { ...process.env, DSH_DESKTOP_AUTH_TOKEN: cfg.authToken },
   });
   serverChild = child;
   ownsServer = true;
@@ -414,72 +537,70 @@ async function ensureServer(cfg) {
     log('无法启动 dsh 进程:', err.message);
   });
   child.on('exit', (code) => {
-    // 退出原因留档；自愈监控会负责重启（见 startMonitor）
     log(`dsh 进程退出，code=${code}。最近输出：\n${tail(out)}`);
-    if (ownsServer) { serverChild = null; ownsServer = false; }
+    if (serverChild === child) { serverChild = null; ownsServer = false; }
   });
 
-  // 3) 等待端口就绪（用局部 child 引用，避免 exit 回调置空 serverChild 后空指针）
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (await probe(cfg.port)) {
-      log(`DSH Web 服务就绪：http://127.0.0.1:${cfg.port}`);
-      return `http://127.0.0.1:${cfg.port}`;
+    if (await probe(port, cfg.authToken)) {
+      log(`DSH Web 服务已通过身份握手：http://127.0.0.1:${port}`);
+      return `http://127.0.0.1:${port}`;
     }
     if (spawnFailed) {
-      throw new Error(`无法启动 "${cfg.dshCommand}"。请确认 dsh 已安装且在 PATH 中（命令行执行 ${cfg.dshCommand} 测试）。`);
+      throw new Error(`无法启动 "${cfg.dshCommand}"。请确认 dsh 已安装且版本支持桌面认证插件。`);
     }
     if (child.exitCode !== null) {
-      throw new Error(`dsh web 提前退出（code ${child.exitCode}）。\n最近输出：\n${tail(out)}`);
+      const output = tail(out);
+      if (port === cfg.port && /EADDRINUSE|address already in use|已被占用/i.test(output)) {
+        cfg.activePort = await getFreePort();
+        return ensureServer(cfg);
+      }
+      throw new Error(`dsh web 提前退出（code ${child.exitCode}）。\n最近输出：\n${output}`);
     }
     await sleep(500);
   }
-  throw new Error(`等待 DSH Web 服务超时（${READY_TIMEOUT_MS / 1000}s）。\n最近输出：\n${tail(out)}`);
+  throw new Error(`等待已认证 DSH Web 服务超时（${READY_TIMEOUT_MS / 1000}s）。\n最近输出：\n${tail(out)}`);
 }
 
-// ── 服务自愈：健康检查 + 自动重启 ───────────────────────────────────────────
-/** 轻量探测：端口有 HTTP 响应即认为存活（不校验页面内容） */
-function lightProbe(port, timeoutMs = 2000) {
-  return new Promise((resolve) => {
-    const req = http.get({ host: '127.0.0.1', port, path: '/', timeout: timeoutMs }, (res) => {
-      res.resume();
-      resolve(res.statusCode < 500);
-    });
-    req.on('timeout', () => { req.destroy(); resolve(false); });
-    req.on('error', () => resolve(false));
-  });
+// ── 服务自愈：认证健康检查 + 单飞重启 ───────────────────────────────────────
+function lightProbe(port, token, timeoutMs = 2000) {
+  return probe(port, token, timeoutMs);
 }
 
 let monitorTimer = null;
 let monitorFails = 0;
+let monitorRestartInFlight = false;
+let monitorRetryAt = 0;
 
-/**
- * 每 5 秒检查一次服务；连续 3 次(约15秒)探测失败就自动重启服务并刷新窗口。
- * 这样 dsh 服务进程无论因何崩溃（含工具调用期间），都会自动拉起，
- * 不会再出现"断开后没有重启"。
- */
-function startMonitor(cfg, getUrl) {
+function startMonitor(cfg) {
   if (monitorTimer) clearInterval(monitorTimer);
   monitorFails = 0;
+  monitorRetryAt = 0;
   monitorTimer = setInterval(async () => {
-    if (quitting) return;
-    const alive = await lightProbe(cfg.port);
+    if (quitting || monitorRestartInFlight || Date.now() < monitorRetryAt) return;
+    const alive = await lightProbe(cfg.activePort || cfg.port, cfg.authToken);
     if (alive) { monitorFails = 0; return; }
     monitorFails++;
     if (monitorFails < 3) return;
     monitorFails = 0;
-    log('检测到 DSH 服务不可用，自动重启中…');
+    monitorRestartInFlight = true;
+    log('检测到 DSH 服务身份握手失败，自动重启中…');
     try {
-      if (serverChild) { try { serverChild.kill(); } catch {} }
-      serverChild = null;
-      ownsServer = false;
+      killServerTree();
       const url = await ensureServer(cfg);
+      cfg.activeUrl = url;
+      monitorRetryAt = 0;
       log(`DSH 服务已自动重启：${url}`);
+      installDesktopAuthHeader(url, cfg.authToken);
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.loadURL(url).catch((e) => log('重启后刷新页面失败:', e.message));
       }
     } catch (e) {
-      log('自动重启失败，继续监控重试:', e.message);
+      monitorRetryAt = Date.now() + Math.min(60_000, 5_000 * (2 ** Math.min(monitorFails + 1, 4)));
+      log('自动重启失败，将退避后重试:', e.message);
+    } finally {
+      monitorRestartInFlight = false;
     }
   }, 5000);
 }
@@ -487,6 +608,30 @@ function startMonitor(cfg, getUrl) {
 // ── 窗口 ────────────────────────────────────────────────────────────────────
 let mainWindow = null;
 let tray = null;
+let desktopAuthOrigin = '';
+let desktopAuthToken = '';
+const authSessions = new WeakSet();
+
+function installDesktopAuthHeader(url, token, session = mainWindow?.webContents?.session) {
+  try {
+    desktopAuthOrigin = new URL(url).origin;
+    desktopAuthToken = token;
+    if (!session || authSessions.has(session)) return;
+    authSessions.add(session);
+    session.webRequest.onBeforeSendHeaders({
+      urls: ['http://127.0.0.1:*/*', 'ws://127.0.0.1:*/*'],
+    }, (details, callback) => {
+      try {
+        if (new URL(details.url).origin === desktopAuthOrigin) {
+          details.requestHeaders[DESKTOP_AUTH_HEADER] = desktopAuthToken;
+        }
+      } catch { /* 非 URL 请求交给 Electron */ }
+      callback({ requestHeaders: details.requestHeaders });
+    });
+  } catch (e) {
+    log('安装桌面认证请求头失败:', e.message);
+  }
+}
 
 function showMainWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -617,6 +762,7 @@ function createWindow(url, cfg) {
     },
   });
   if (saved.maximized) win.maximize();
+  installDesktopAuthHeader(url, cfg.authToken, win.webContents.session);
 
   // 冒烟测试钩子：DSH_DESKTOP_SMOKE_TEST=1 时，加载后验证「关窗隐藏」行为再自动退出
   if (process.env.DSH_DESKTOP_SMOKE_TEST === '1') {
@@ -665,19 +811,29 @@ function createWindow(url, cfg) {
 
   win.loadURL(url).catch((e) => log('页面加载异常:', e.message));
 
-  // 同源（本服务内的）弹窗/跳转放行；跨源的一律交给系统默认浏览器
+  // 仅允许当前已认证服务 origin；外链只允许 http(s) 交给系统浏览器。
   const isSameOrigin = (target) => {
-    try { return new URL(target).origin === new URL(url).origin; } catch { return false; }
+    try { return new URL(target).origin === desktopAuthOrigin; } catch { return false; }
   };
+  const isSafeExternal = (target) => {
+    try { return ['http:', 'https:'].includes(new URL(target).protocol); } catch { return false; }
+  };
+  const openSafeExternal = (target) => { if (isSafeExternal(target)) shell.openExternal(target); else log(`已拒绝危险外部协议：${target}`); };
   win.webContents.setWindowOpenHandler(({ url: target }) => {
-    if (isSameOrigin(target)) return {}; // 允许
-    shell.openExternal(target);
+    if (isSameOrigin(target)) return {};
+    openSafeExternal(target);
     return { action: 'deny' };
   });
   win.webContents.on('will-navigate', (event, target) => {
     if (!isSameOrigin(target)) {
       event.preventDefault();
-      shell.openExternal(target);
+      openSafeExternal(target);
+    }
+  });
+  win.webContents.on('will-redirect', (event, target) => {
+    if (!isSameOrigin(target)) {
+      event.preventDefault();
+      openSafeExternal(target);
     }
   });
 
@@ -726,6 +882,7 @@ if (!gotLock) {
     log('=== DSH Desktop 启动 ===');
 
     const cfg = loadConfig();
+    cfg.authToken = getDesktopAuthToken();
     const dsh = await resolveDshCommand(cfg);
     if (!dsh) {
       showFatal('自动安装 DSH 失败。\n\n请手动安装后重试：\n  npm install -g @deepseek-ai/dsh\n\n（需要本机已安装 Node.js：https://nodejs.org）');
@@ -733,7 +890,7 @@ if (!gotLock) {
       return;
     }
     cfg.dshCommand = dsh.command;
-    deployPlugins(dsh.nodeModulesDir);
+    deployPlugins();
 
     let url;
     try {
@@ -745,12 +902,13 @@ if (!gotLock) {
       return;
     }
 
+    cfg.activeUrl = url;
     mainWindow = createWindow(url, cfg);
     createTray(iconPathFor(cfg));
-    startMonitor(cfg, () => url);
+    startMonitor(cfg);
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow(url, cfg);
+      if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow(cfg.activeUrl || url, cfg);
     });
   });
 }

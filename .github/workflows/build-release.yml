@@ -23,6 +23,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Static checks
+        run: npm run lint
+
+      - name: Security smoke test
+        run: npm test
+
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Build portable exe
         run: npm run dist
 
@@ -45,6 +54,15 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Static checks
+        run: npm run lint
+
+      - name: Security smoke test
+        run: npm test
+
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Build macOS app (dmg + zip, x64 + arm64)
         run: npm run dist:mac

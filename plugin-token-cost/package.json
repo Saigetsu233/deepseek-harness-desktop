@@ -1,6 +1,6 @@
 {
   "name": "token-cost",
-  "version": "1.0.0",
+  "version": "1.4.0",
   "description": "DeepSeek token cost tracker for the DSH Web UI: daily spend with peak/off-peak pricing",
   "type": "module",
   "main": "lib/index.js",
