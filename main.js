@@ -187,7 +187,7 @@ function spawnSafe(command, args, options = {}) {
   const base = { ...options, shell: false, windowsHide: true };
   if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(command)) {
     if (/[&|<>^%\n\r]/.test(command)) throw new Error('可执行文件路径包含不允许的 Shell 字符');
-    const commandLine = `"${command}" ${args.map((arg) => {
+    const commandLine = `call "${command}" ${args.map((arg) => {
       const value = String(arg);
       if (/^[a-zA-Z0-9_./:=+-]+$/.test(value)) return value;
       if (/[&|<>^%\n\r]/.test(value)) throw new Error('命令参数包含不允许的 Shell 字符');
@@ -295,10 +295,12 @@ async function autoInstallDsh() {
     child.stdout?.on('data', (d) => showLog(d.toString()));
     child.stderr?.on('data', (d) => showLog(d.toString()));
     child.on('error', (err) => {
+      log('无法启动 npm：', err.message);
       showLog('无法启动 npm：' + err.message);
       resolve(false);
     });
     child.on('exit', (code) => {
+      log(`npm 安装退出，code=${code}`);
       showLog(code === 0 ? '安装完成，开始校验 ✓' : '安装失败（退出码 ' + code + '）');
       resolve(code === 0);
     });
@@ -885,7 +887,7 @@ if (!gotLock) {
     cfg.authToken = getDesktopAuthToken();
     const dsh = await resolveDshCommand(cfg);
     if (!dsh) {
-      showFatal('自动安装 DSH 失败。\n\n请手动安装后重试：\n  npm install -g @deepseek-ai/dsh\n\n（需要本机已安装 Node.js：https://nodejs.org）');
+      showFatal(`自动安装 DSH 失败。\n\n请确认 Node.js/npm 可用，或手动执行：\n  npm install --prefix "${localDshDir()}" --ignore-scripts @deepseek-ai/dsh@${DSH_VERSION}\n\n诊断日志：${path.join(localDshDir(), '.npm-cache', '_logs')}\n应用日志：${path.join(app.getPath('userData'), 'server.log')}\n\nNode.js：https://nodejs.org`);
       app.exit(1);
       return;
     }
