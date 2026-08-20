@@ -612,21 +612,24 @@ function startMonitor(cfg) {
 // ── 窗口 ────────────────────────────────────────────────────────────────────
 let mainWindow = null;
 let tray = null;
-let desktopAuthOrigin = '';
+let desktopAuthAuthority = '';
 let desktopAuthToken = '';
 const authSessions = new WeakSet();
 
 function installDesktopAuthHeader(url, token, session = mainWindow?.webContents?.session) {
   try {
-    desktopAuthOrigin = new URL(url).origin;
+    const serviceUrl = new URL(url);
+    desktopAuthAuthority = serviceUrl.host;
     desktopAuthToken = token;
     if (!session || authSessions.has(session)) return;
     authSessions.add(session);
     session.webRequest.onBeforeSendHeaders({
-      urls: ['http://127.0.0.1:*/*', 'ws://127.0.0.1:*/*'],
+      urls: ['*://127.0.0.1:*/*'],
     }, (details, callback) => {
       try {
-        if (new URL(details.url).origin === desktopAuthOrigin) {
+        const requestUrl = new URL(details.url);
+        if (requestUrl.host === desktopAuthAuthority &&
+            ['http:', 'https:', 'ws:', 'wss:'].includes(requestUrl.protocol)) {
           details.requestHeaders[DESKTOP_AUTH_HEADER] = desktopAuthToken;
         }
       } catch { /* 非 URL 请求交给 Electron */ }
@@ -817,7 +820,10 @@ function createWindow(url, cfg) {
 
   // 仅允许当前已认证服务 origin；外链只允许 http(s) 交给系统浏览器。
   const isSameOrigin = (target) => {
-    try { return new URL(target).origin === desktopAuthOrigin; } catch { return false; }
+    try {
+      const targetUrl = new URL(target);
+      return targetUrl.host === desktopAuthAuthority && ['http:', 'https:'].includes(targetUrl.protocol);
+    } catch { return false; }
   };
   const isSafeExternal = (target) => {
     try { return ['http:', 'https:'].includes(new URL(target).protocol); } catch { return false; }
