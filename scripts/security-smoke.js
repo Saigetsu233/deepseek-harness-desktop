@@ -9,7 +9,7 @@ async function main() {
   const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
   assert.doesNotMatch(mainSource, /shell:\s*true/, 'desktop startup must not use shell:true');
   assert.match(mainSource, /DSH_VERSION = '0\.1\.0-rc\.7'/, 'DSH version must remain pinned');
-  assert.match(mainSource, /const commandLine = `call "/, 'Windows cmd wrappers must use call safely');
+  assert.match(mainSource, /\['\/d', '\/s', '\/c', 'call', command, \.\.\.safeArgs\]/, 'Windows cmd wrappers must use call safely');
   process.env.DSH_DESKTOP_AUTH_TOKEN = 'a'.repeat(64);
   const { apply } = await import('../plugin-token-cost/lib/index.js');
   const routes = [];

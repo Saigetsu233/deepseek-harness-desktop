@@ -187,13 +187,14 @@ function spawnSafe(command, args, options = {}) {
   const base = { ...options, shell: false, windowsHide: true };
   if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(command)) {
     if (/[&|<>^%\n\r]/.test(command)) throw new Error('可执行文件路径包含不允许的 Shell 字符');
-    const commandLine = `call "${command}" ${args.map((arg) => {
+    const safeArgs = args.map((arg) => {
       const value = String(arg);
-      if (/^[a-zA-Z0-9_./:=+-]+$/.test(value)) return value;
-      if (/[&|<>^%\n\r]/.test(value)) throw new Error('命令参数包含不允许的 Shell 字符');
-      return `"${value.replace(/"/g, '\\"')}"`;
-    }).join(' ')}`;
-    return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', commandLine], base);
+      if (/[&|<>^%\n\r\0]/.test(value)) throw new Error('命令参数包含不允许的 Shell 字符');
+      return value;
+    });
+    // Pass /c, call, executable, and argv as separate spawn arguments. Building
+    // one quoted command string breaks cmd.exe when the executable path has spaces.
+    return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', 'call', command, ...safeArgs], base);
   }
   return spawn(command, args, base);
 }
