@@ -8,6 +8,7 @@ const path = require('node:path');
 async function main() {
   const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
   assert.doesNotMatch(mainSource, /shell:\s*true/, 'desktop startup must not use shell:true');
+  assert.doesNotMatch(mainSource, /spawnArgs = \['web', '--no-open'/, 'pinned DSH rc.7 does not support --no-open');
   assert.match(mainSource, /DSH_VERSION = '0\.1\.0-rc\.7'/, 'DSH version must remain pinned');
   assert.match(mainSource, /\['\/d', '\/s', '\/c', 'call', command, \.\.\.safeArgs\]/, 'Windows cmd wrappers must use call safely');
   process.env.DSH_DESKTOP_AUTH_TOKEN = 'a'.repeat(64);

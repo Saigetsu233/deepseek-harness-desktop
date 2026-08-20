@@ -8,7 +8,7 @@
  *     占用端口时切换到随机 loopback 端口，避免加载伪造页面。
  *  2. dsh 命令自动就绪：检测顺序为 应用自带安装 → 系统 PATH → 都没有则弹出
  *     进度窗口安装固定版本（装到应用用户目录，无需管理员权限）。
- *  3. 启动 `dsh web --no-open --host 127.0.0.1 --port <port>`（配置的工作目录作为 workspace 根），
+ *  3. 启动 `dsh web --host 127.0.0.1 --port <port>`（配置的工作目录作为 workspace 根），
  *     Electron 为所有请求注入 desktop token；关闭窗口=隐藏到托盘继续后台运行，
  *     只有托盘菜单"退出"才真正退出并停止自启的 dsh 进程（连同子进程）。
  *  4. 渲染进程崩溃/页面加载失败会自动重载恢复，不会整个窗口消失。
@@ -514,7 +514,8 @@ async function ensureServer(cfg) {
   }
   cfg.activePort = port;
 
-  const spawnArgs = ['web', '--no-open', '--host', '127.0.0.1', '--port', String(port)];
+  // rc.7 的 web 启动器不支持 --no-open；保持参数兼容，只显式绑定回环地址。
+  const spawnArgs = ['web', '--host', '127.0.0.1', '--port', String(port)];
   log(`启动 dsh web（端口 ${port}，workspace "${cfg.workspace}"，命令 "${cfg.dshCommand}"）`);
   let spawnFailed = false;
   const child = spawnSafe(cfg.dshCommand, spawnArgs, {
